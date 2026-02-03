@@ -181,10 +181,70 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev):
         inps = outs
         torch.cuda.empty_cache()
     return profiling_mat
+
+
+def profile_grad_diag(model_name, model, calib_loader, dev, max_batches=None, grad_eps=1e-6):
+    if "llama" in model_name or "mistral" in model_name or "vicuna" in model_name:
+        layers = model.model.layers
+    elif "opt" in model_name:
+        layers = model.model.decoder.layers
+    model = model.to(dev)
+    model.eval()
+    prev_grad = torch.is_grad_enabled()
+    torch.set_grad_enabled(True)
+
+    handles = []
+    def hook(module, grad_input, grad_output):
+        if grad_output is None or grad_output[0] is None:
+            return
+        gout = grad_output[0].detach()
+        if gout.dim() == 2:  # for opt
+            gout = gout.unsqueeze(0)
+        # gout: [bs, seq, out]
+        sumsq = gout.pow(2).sum(dim=(0, 1))
+        module.grad_squares_sum += sumsq
+        module.grad_squares_count += gout.shape[0] * gout.shape[1]
+
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            module.grad_squares_sum = torch.zeros(module.weight.shape[0], device=dev)
+            module.grad_squares_count = 0
+            handles.append(module.register_full_backward_hook(hook))
+
+    for i, batch in enumerate(tqdm(calib_loader)):
+        if max_batches is not None and i >= max_batches:
+            break
+        model.zero_grad(set_to_none=True)
+        batch = {k: v.to(dev) for k, v in batch.items()}
+        labels = batch["input_ids"]
+        outputs = model(**batch, labels=labels)
+        loss = outputs.loss
+        loss.backward()
+        model.zero_grad(set_to_none=True)
+        torch.cuda.empty_cache()
+
+    for h in handles:
+        h.remove()
+
+    grad_diag = {}
+    for i in range(len(layers)):
+        layer_profile = {}
+        subset = find_layers(layers[i])
+        for name in subset:
+            module = subset[name]
+            count = max(module.grad_squares_count, 1)
+            diag = (module.grad_squares_sum / count).clamp_min(grad_eps)
+            layer_profile[name] = diag.cpu()
+            del module.grad_squares_sum
+            del module.grad_squares_count
+        grad_diag[i] = layer_profile
+    model = model.cpu()
+    torch.set_grad_enabled(prev_grad)
+    return grad_diag
      
  
 @torch.no_grad()
-def whitening(model_name, model, profiling_mat, ratio, dev):
+def whitening(model_name, model, profiling_mat, ratio, dev, grad_diag=None, grad_eps=1e-6):
     model.eval()
     if 'opt' in model_name:
         layers = model.model.decoder.layers
@@ -207,6 +267,12 @@ def whitening(model_name, model, profiling_mat, ratio, dev):
         for name in subset:
             W = subset[name].weight.data.float().to(dev)
             dtype = W.dtype
+            g_inv_sqrt = None
+            if grad_diag is not None:
+                g_diag = grad_diag[i][name].to(dev)
+                g_sqrt = torch.sqrt(torch.clamp(g_diag, min=grad_eps))
+                g_inv_sqrt = 1.0 / g_sqrt
+                W = W * g_sqrt.unsqueeze(1)
             scaling_diag_matrix = profiling_mat[i][name].to(dev)
             try:
                 scaling_matrix_inv = torch.linalg.inv(scaling_diag_matrix)
@@ -221,6 +287,8 @@ def whitening(model_name, model, profiling_mat, ratio, dev):
             num_s_after_trunc = int(W.shape[0] * W.shape[1] * ratio / (W.shape[0] + W.shape[1]))
             truc_s = S[:num_s_after_trunc]
             truc_u = U[:, :num_s_after_trunc]
+            if g_inv_sqrt is not None:
+                truc_u = g_inv_sqrt.unsqueeze(1) * truc_u
             truc_v = torch.matmul(VT[:num_s_after_trunc, :], scaling_matrix_inv)
             truc_sigma = torch.diag(truc_s)
             #### Replace Attn, MLP ####
@@ -286,7 +354,7 @@ def whitening(model_name, model, profiling_mat, ratio, dev):
 
 
 @torch.no_grad()
-def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, dev, direct_update=False):
+def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, dev, direct_update=False, grad_diag=None, grad_eps=1e-6):
     print("Start SVD decomposition then update...")
     use_cache = model.config.use_cache
     model.config.use_cache = False
@@ -355,7 +423,11 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
                 scaling_diag_matrix = profiling_mat[i][name].to(dev)
             else: 
                 scaling_diag_matrix = None
-            gpts[name] = local_update(subset[name], scaling_diag_matrix = scaling_diag_matrix, ratio=ratio, name=name, direct_update=direct_update)
+            if grad_diag is not None:
+                g_diag = grad_diag[i][name].to(dev)
+            else:
+                g_diag = None
+            gpts[name] = local_update(subset[name], scaling_diag_matrix = scaling_diag_matrix, ratio=ratio, name=name, direct_update=direct_update, g_diag=g_diag, grad_eps=grad_eps)
         
         def add_batch(name):
             def tmp(_, inp, out):
@@ -440,7 +512,7 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
 
 
 class local_update:
-    def __init__(self, layer, scaling_diag_matrix, ratio, name, direct_update=False):
+    def __init__(self, layer, scaling_diag_matrix, ratio, name, direct_update=False, g_diag=None, grad_eps=1e-6):
         self.layer = layer
         self.name = name
         self.dev = self.layer.weight.device
@@ -448,6 +520,16 @@ class local_update:
         W = layer.weight.data.clone()
         self.rows = W.shape[0]
         self.columns = W.shape[1]
+        g_inv_sqrt = None
+        self.g_sqrt = None
+        self.g_inv_sqrt = None
+        if g_diag is not None:
+            g_diag = g_diag.to(self.dev)
+            g_sqrt = torch.sqrt(torch.clamp(g_diag, min=grad_eps))
+            g_inv_sqrt = 1.0 / g_sqrt
+            self.g_sqrt = g_sqrt
+            self.g_inv_sqrt = g_inv_sqrt
+            W = W * g_sqrt.unsqueeze(1)
         if direct_update:
             self.U, self.S, self.VT = torch.linalg.svd(W.data, full_matrices=False)
         else: 
@@ -465,6 +547,8 @@ class local_update:
         num_s_after_trunc = int(W.shape[0] * W.shape[1] * ratio / (W.shape[0] + W.shape[1]))
         self.truc_s = self.S[:num_s_after_trunc].cuda()
         self.truc_u = self.U[:, :num_s_after_trunc].cuda()
+        if g_inv_sqrt is not None:
+            self.truc_u = g_inv_sqrt.unsqueeze(1) * self.truc_u
         if direct_update:
             self.truc_v = self.VT[:num_s_after_trunc, :].cuda()
         else:
@@ -479,12 +563,24 @@ class local_update:
         outs = out.view(out.shape[0] * out.shape[1], out.shape[2])
         new_w = torch.matmul(self.truc_u, torch.matmul(self.truc_sigma, self.truc_v))
         new_output = inps.matmul(new_w.t())
-        self.error = torch.sqrt(torch.sum((outs - new_output)**2)).item() / torch.norm(outs, p='fro').item()
-        # print(f"truncted error: {self.error}")
-        x =  torch.matmul(torch.matmul(inps, self.truc_v.T), self.truc_sigma)
-        self.updated_uT = torch.linalg.lstsq(x,outs).solution
-        updated_output = torch.matmul(torch.matmul(torch.matmul(inps, self.truc_v.T), self.truc_sigma), self.updated_uT)
-        self.updated_error = torch.sqrt(torch.sum((outs - updated_output)**2)).item() / torch.norm(outs, p='fro').item()
+        if self.g_sqrt is not None:
+            outs_w = outs * self.g_sqrt
+            new_output_w = new_output * self.g_sqrt
+            self.error = torch.sqrt(torch.sum((outs_w - new_output_w) ** 2)).item() / torch.norm(outs_w, p='fro').item()
+            # print(f"truncted error: {self.error}")
+            x = torch.matmul(torch.matmul(inps, self.truc_v.T), self.truc_sigma)
+            updated_uT_w = torch.linalg.lstsq(x, outs_w).solution
+            self.updated_uT = updated_uT_w * self.g_inv_sqrt.unsqueeze(0)
+            updated_output = torch.matmul(torch.matmul(torch.matmul(inps, self.truc_v.T), self.truc_sigma), self.updated_uT)
+            updated_output_w = updated_output * self.g_sqrt
+            self.updated_error = torch.sqrt(torch.sum((outs_w - updated_output_w) ** 2)).item() / torch.norm(outs_w, p='fro').item()
+        else:
+            self.error = torch.sqrt(torch.sum((outs - new_output)**2)).item() / torch.norm(outs, p='fro').item()
+            # print(f"truncted error: {self.error}")
+            x =  torch.matmul(torch.matmul(inps, self.truc_v.T), self.truc_sigma)
+            self.updated_uT = torch.linalg.lstsq(x,outs).solution
+            updated_output = torch.matmul(torch.matmul(torch.matmul(inps, self.truc_v.T), self.truc_sigma), self.updated_uT)
+            self.updated_error = torch.sqrt(torch.sum((outs - updated_output)**2)).item() / torch.norm(outs, p='fro').item()
         # print(f"updated error: {self.updated_error}")
         inps = outs = new_output = updated_output = x = new_w = None
         del inps, outs, new_output, updated_output, x, new_w
@@ -511,6 +607,10 @@ if __name__ == '__main__':
     parser.add_argument('--updating_nsamples', type=int, default=16, help='Number of calibration data samples for udpating.')
     parser.add_argument('--save_path', type=str, default=None, help='the path to save the compressed model checkpoints.`')
     parser.add_argument('--profiling_mat_path', type=str, default=None, help='Local path to load the profiling matrices`')
+    parser.add_argument('--use_grad_g', action='store_true', help='whether to use output-gradient diag weighting')
+    parser.add_argument('--grad_nsamples', type=int, default=None, help='Number of calibration batches for grad diag estimation')
+    parser.add_argument('--grad_path', type=str, default=None, help='Local path to load grad diag (G) matrices')
+    parser.add_argument('--grad_eps', type=float, default=1e-6, help='Epsilon to avoid zero in grad diag')
     parser.add_argument('--seed',type=int, default=0, help='Seed for sampling the calibration data')
     parser.add_argument('--DEV', type=str, default="cuda", help='device')
     parser.add_argument('--model_seq_len', type=int, default=2048, help='the default sequence length of the LLM')
@@ -524,6 +624,7 @@ if __name__ == '__main__':
     if args.step == 1:
         model, tokenizer = get_model_from_huggingface(model_id=args.model)
         model = model.eval()
+        grad_diag = None
         if args.profiling_mat_path is None:
             cali_white_data = get_calib_train_data(args.dataset, tokenizer, args.whitening_nsamples, seqlen=args.model_seq_len)
             profiling_mat = profle_svdllm_low_resource(args.model, model, cali_white_data, args.DEV)
@@ -531,7 +632,17 @@ if __name__ == '__main__':
                 torch.save(profiling_mat, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_profiling_'+ args.dataset + '_' + str(args.whitening_nsamples)  + '_' + str(args.seed)+ '.pt')
         else:
             profiling_mat = torch.load(args.profiling_mat_path)
-        whitening(args.model, model, profiling_mat, args.ratio, args.DEV)
+        if args.use_grad_g:
+            if args.grad_path is not None:
+                grad_diag = torch.load(args.grad_path)
+            else:
+                grad_nsamples = args.grad_nsamples if args.grad_nsamples is not None else args.whitening_nsamples
+                if "cali_white_data" not in locals():
+                    cali_white_data = get_calib_train_data(args.dataset, tokenizer, args.whitening_nsamples, seqlen=args.model_seq_len)
+                grad_diag = profile_grad_diag(args.model, model, cali_white_data, args.DEV, max_batches=grad_nsamples, grad_eps=args.grad_eps)
+                if args.save_path is not None:
+                    torch.save(grad_diag, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_grad_diag_'+ args.dataset + '_' + str(grad_nsamples)  + '_' + str(args.seed)+ '.pt')
+        whitening(args.model, model, profiling_mat, args.ratio, args.DEV, grad_diag=grad_diag, grad_eps=args.grad_eps)
         if args.save_path is not None:
             torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_only_' + str(args.ratio) + '.pt')   # fp32
     elif args.step == 2:
@@ -539,6 +650,7 @@ if __name__ == '__main__':
         dataloader, _ = get_loaders(args.dataset, nsamples=args.updating_nsamples, seed=args.seed, tokenizer=tokenizer, seqlen=args.model_seq_len)
         model = model.eval()
         model = model.float()  # need to set to float
+        grad_diag = None
         if args.profiling_mat_path is None:
             cali_white_data = get_calib_train_data(args.dataset, tokenizer, args.whitening_nsamples, seqlen=args.model_seq_len)
             profiling_mat = profle_svdllm_low_resource(args.model, model, cali_white_data, args.DEV)
@@ -546,7 +658,17 @@ if __name__ == '__main__':
                 torch.save(profiling_mat, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_profiling_'+ args.dataset + '_' + str(args.whitening_nsamples)  + '_' + str(args.seed)+ '.pt')
         else:
             profiling_mat = torch.load(args.profiling_mat_path)
-        whitening_local_update(args.model, model, dataloader, profiling_mat, args.ratio, args.DEV)
+        if args.use_grad_g:
+            if args.grad_path is not None:
+                grad_diag = torch.load(args.grad_path)
+            else:
+                grad_nsamples = args.grad_nsamples if args.grad_nsamples is not None else args.whitening_nsamples
+                if "cali_white_data" not in locals():
+                    cali_white_data = get_calib_train_data(args.dataset, tokenizer, args.whitening_nsamples, seqlen=args.model_seq_len)
+                grad_diag = profile_grad_diag(args.model, model, cali_white_data, args.DEV, max_batches=grad_nsamples, grad_eps=args.grad_eps)
+                if args.save_path is not None:
+                    torch.save(grad_diag, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_grad_diag_'+ args.dataset + '_' + str(grad_nsamples)  + '_' + str(args.seed)+ '.pt')
+        whitening_local_update(args.model, model, dataloader, profiling_mat, args.ratio, args.DEV, grad_diag=grad_diag, grad_eps=args.grad_eps)
         if args.save_path is not None:
             torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_then_update_' + str(args.ratio) + '.pt')  # fp32
     elif args.step == 3:
@@ -554,7 +676,17 @@ if __name__ == '__main__':
         model = model.eval()
         model = model.float()
         dataloader, _ = get_loaders(args.dataset, nsamples=args.updating_nsamples, seed=args.seed, tokenizer=tokenizer, seqlen=args.model_seq_len)
-        whitening_local_update(model_name=args.model, model=model, dataloader=dataloader, profiling_mat=None, ratio=args.ratio, dev=args.DEV, direct_update=True)
+        grad_diag = None
+        if args.use_grad_g:
+            if args.grad_path is not None:
+                grad_diag = torch.load(args.grad_path)
+            else:
+                grad_nsamples = args.grad_nsamples if args.grad_nsamples is not None else args.whitening_nsamples
+                cali_white_data = get_calib_train_data(args.dataset, tokenizer, args.whitening_nsamples, seqlen=args.model_seq_len)
+                grad_diag = profile_grad_diag(args.model, model, cali_white_data, args.DEV, max_batches=grad_nsamples, grad_eps=args.grad_eps)
+                if args.save_path is not None:
+                    torch.save(grad_diag, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_grad_diag_'+ args.dataset + '_' + str(grad_nsamples)  + '_' + str(args.seed)+ '.pt')
+        whitening_local_update(model_name=args.model, model=model, dataloader=dataloader, profiling_mat=None, ratio=args.ratio, dev=args.DEV, direct_update=True, grad_diag=grad_diag, grad_eps=args.grad_eps)
         if args.save_path is not None:
             torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_update_only_' + str(args.ratio) + '.pt')   # fp32
     elif args.step >= 4:
