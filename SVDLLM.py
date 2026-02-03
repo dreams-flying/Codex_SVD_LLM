@@ -183,7 +183,31 @@ def profle_svdllm_low_resource(model_name, model, calib_loader, dev):
     return profiling_mat
 
 
-def profile_grad_diag(model_name, model, calib_loader, dev, max_batches=None, grad_eps=1e-6):
+def _safe_cholesky(mat, eps=1e-6):
+    try:
+        return torch.linalg.cholesky(mat)
+    except Exception:
+        eig = torch.linalg.eigvalsh(mat)
+        mat = mat + (-eig[0] + eps) * torch.eye(mat.shape[0], device=mat.device, dtype=mat.dtype)
+        return torch.linalg.cholesky(mat)
+
+
+def _get_block_size(name, model, attn_block_size, mlp_block_size):
+    hidden_size = model.config.hidden_size
+    num_heads = getattr(model.config, "num_attention_heads", None)
+    head_dim = hidden_size // num_heads if num_heads else None
+    if any(k in name for k in ("q_proj", "k_proj", "v_proj", "o_proj", "out_proj")):
+        if attn_block_size and attn_block_size > 0:
+            return attn_block_size
+        return head_dim if head_dim else 0
+    if any(k in name for k in ("gate_proj", "up_proj", "down_proj", "fc1", "fc2")):
+        if mlp_block_size and mlp_block_size > 0:
+            return mlp_block_size
+        return hidden_size
+    return 0
+
+
+def profile_grad_diag(model_name, model, calib_loader, dev, max_batches=None, grad_eps=1e-6, block_diag=False, attn_block_size=0, mlp_block_size=0):
     if "llama" in model_name or "mistral" in model_name or "vicuna" in model_name:
         layers = model.model.layers
     elif "opt" in model_name:
@@ -201,14 +225,41 @@ def profile_grad_diag(model_name, model, calib_loader, dev, max_batches=None, gr
         if gout.dim() == 2:  # for opt
             gout = gout.unsqueeze(0)
         # gout: [bs, seq, out]
-        sumsq = gout.pow(2).sum(dim=(0, 1))
-        module.grad_squares_sum += sumsq
-        module.grad_squares_count += gout.shape[0] * gout.shape[1]
+        if getattr(module, "grad_block_ranges", None) is not None:
+            gout2d = gout.reshape(-1, gout.shape[-1])
+            n = gout2d.shape[0]
+            module.grad_blocks_count += n
+            for bi, (s, e) in enumerate(module.grad_block_ranges):
+                block = gout2d[:, s:e]
+                module.grad_blocks_sum[bi] += block.t().matmul(block)
+        else:
+            sumsq = gout.pow(2).sum(dim=(0, 1))
+            module.grad_squares_sum += sumsq
+            module.grad_squares_count += gout.shape[0] * gout.shape[1]
 
     for name, module in model.named_modules():
         if isinstance(module, nn.Linear):
-            module.grad_squares_sum = torch.zeros(module.weight.shape[0], device=dev)
-            module.grad_squares_count = 0
+            if block_diag:
+                block_size = _get_block_size(name, model, attn_block_size, mlp_block_size)
+                out_dim = module.weight.shape[0]
+                if block_size and block_size > 0:
+                    ranges = []
+                    for s in range(0, out_dim, block_size):
+                        e = min(s + block_size, out_dim)
+                        ranges.append((s, e))
+                    module.grad_block_ranges = ranges
+                    module.grad_blocks_sum = [
+                        torch.zeros((e - s, e - s), device=dev) for (s, e) in ranges
+                    ]
+                    module.grad_blocks_count = 0
+                else:
+                    module.grad_block_ranges = None
+                    module.grad_squares_sum = torch.zeros(out_dim, device=dev)
+                    module.grad_squares_count = 0
+            else:
+                module.grad_block_ranges = None
+                module.grad_squares_sum = torch.zeros(module.weight.shape[0], device=dev)
+                module.grad_squares_count = 0
             handles.append(module.register_full_backward_hook(hook))
 
     for i, batch in enumerate(tqdm(calib_loader)):
@@ -232,19 +283,104 @@ def profile_grad_diag(model_name, model, calib_loader, dev, max_batches=None, gr
         subset = find_layers(layers[i])
         for name in subset:
             module = subset[name]
-            count = max(module.grad_squares_count, 1)
-            diag = (module.grad_squares_sum / count).clamp_min(grad_eps)
-            layer_profile[name] = diag.cpu()
-            del module.grad_squares_sum
-            del module.grad_squares_count
+            if getattr(module, "grad_block_ranges", None) is not None and module.grad_block_ranges:
+                count = max(module.grad_blocks_count, 1)
+                blocks = []
+                for bi, (s, e) in enumerate(module.grad_block_ranges):
+                    mat = module.grad_blocks_sum[bi] / count
+                    if grad_eps:
+                        mat = mat + grad_eps * torch.eye(mat.shape[0], device=mat.device, dtype=mat.dtype)
+                    blocks.append({"start": s, "end": e, "mat": mat.cpu()})
+                layer_profile[name] = {"type": "block", "blocks": blocks}
+                del module.grad_blocks_sum
+                del module.grad_blocks_count
+            else:
+                count = max(module.grad_squares_count, 1)
+                diag = (module.grad_squares_sum / count).clamp_min(grad_eps)
+                layer_profile[name] = diag.cpu()
+                del module.grad_squares_sum
+                del module.grad_squares_count
         grad_diag[i] = layer_profile
     model = model.cpu()
     torch.set_grad_enabled(prev_grad)
     return grad_diag
+
+
+def compute_layer_ratios(model_name, model, grad_diag, base_ratio, min_ratio=0.01, max_ratio=0.99, eps=1e-6):
+    if "llama" in model_name or "mistral" in model_name or "vicuna" in model_name:
+        layers = model.model.layers
+    elif "opt" in model_name:
+        layers = model.model.decoder.layers
+    else:
+        return None
+    layer_sizes = []
+    layer_scores = []
+    for i in range(len(layers)):
+        subset = find_layers(layers[i])
+        size_i = 0
+        score_i = 0.0
+        for name in subset:
+            W = subset[name].weight
+            size_i += W.shape[0] * W.shape[1]
+            if grad_diag is not None and i in grad_diag and name in grad_diag[i]:
+                entry = grad_diag[i][name]
+                if isinstance(entry, dict) and entry.get("type") == "block":
+                    for b in entry["blocks"]:
+                        mat = b["mat"]
+                        score_i += float(torch.trace(mat).item())
+                else:
+                    score_i += float(entry.sum().item())
+        if score_i <= 0:
+            score_i = eps
+        layer_sizes.append(size_i)
+        layer_scores.append(score_i)
+    total_size = sum(layer_sizes)
+    if total_size == 0:
+        return None
+    weighted_mean = sum(s * w for s, w in zip(layer_sizes, layer_scores)) / total_size
+    ratios = [base_ratio * (w / weighted_mean) for w in layer_scores]
+    target = base_ratio * total_size
+
+    # Iteratively clamp and rescale to hit the global budget.
+    for _ in range(5):
+        fixed = []
+        free = []
+        for i, r in enumerate(ratios):
+            if r < min_ratio:
+                ratios[i] = min_ratio
+                fixed.append(i)
+            elif r > max_ratio:
+                ratios[i] = max_ratio
+                fixed.append(i)
+            else:
+                free.append(i)
+        fixed_size = sum(layer_sizes[i] for i in fixed)
+        free_size = sum(layer_sizes[i] for i in free)
+        if free_size <= 0:
+            break
+        fixed_budget = sum(layer_sizes[i] * ratios[i] for i in fixed)
+        remain = target - fixed_budget
+        if remain <= 0:
+            break
+        scale = remain / sum(layer_sizes[i] * ratios[i] for i in free)
+        updated = False
+        for i in free:
+            new_r = ratios[i] * scale
+            if new_r < min_ratio:
+                ratios[i] = min_ratio
+                updated = True
+            elif new_r > max_ratio:
+                ratios[i] = max_ratio
+                updated = True
+            else:
+                ratios[i] = new_r
+        if not updated:
+            break
+    return ratios
      
  
 @torch.no_grad()
-def whitening(model_name, model, profiling_mat, ratio, dev, grad_diag=None, grad_eps=1e-6):
+def whitening(model_name, model, profiling_mat, ratio, dev, grad_diag=None, grad_eps=1e-6, layer_ratios=None):
     model.eval()
     if 'opt' in model_name:
         layers = model.model.decoder.layers
@@ -253,6 +389,7 @@ def whitening(model_name, model, profiling_mat, ratio, dev, grad_diag=None, grad
     print("Start SVD decomposition after whitening...")
     for i in tqdm(range(len(layers))):
         layer = layers[i]
+        ratio_i = layer_ratios[i] if layer_ratios is not None else ratio
         subset = find_layers(layer)
         #### Replace Attn, MLP ####
         if "llama" in model_name or "vicuna" in model_name:
@@ -268,11 +405,23 @@ def whitening(model_name, model, profiling_mat, ratio, dev, grad_diag=None, grad
             W = subset[name].weight.data.float().to(dev)
             dtype = W.dtype
             g_inv_sqrt = None
+            g_blocks = None
             if grad_diag is not None:
-                g_diag = grad_diag[i][name].to(dev)
-                g_sqrt = torch.sqrt(torch.clamp(g_diag, min=grad_eps))
-                g_inv_sqrt = 1.0 / g_sqrt
-                W = W * g_sqrt.unsqueeze(1)
+                entry = grad_diag[i][name]
+                if isinstance(entry, dict) and entry.get("type") == "block":
+                    g_blocks = []
+                    for b in entry["blocks"]:
+                        s, e = b["start"], b["end"]
+                        mat = b["mat"].to(dev)
+                        chol = _safe_cholesky(mat, grad_eps)
+                        inv_chol = torch.linalg.inv(chol)
+                        g_blocks.append({"start": s, "end": e, "g_sqrt": chol, "g_inv_sqrt": inv_chol})
+                        W[s:e, :] = chol.matmul(W[s:e, :])
+                else:
+                    g_diag = entry.to(dev)
+                    g_sqrt = torch.sqrt(torch.clamp(g_diag, min=grad_eps))
+                    g_inv_sqrt = 1.0 / g_sqrt
+                    W = W * g_sqrt.unsqueeze(1)
             scaling_diag_matrix = profiling_mat[i][name].to(dev)
             try:
                 scaling_matrix_inv = torch.linalg.inv(scaling_diag_matrix)
@@ -284,10 +433,14 @@ def whitening(model_name, model, profiling_mat, ratio, dev, grad_diag=None, grad
             scaling_matrix_inv = scaling_matrix_inv.float()
             W_scale = torch.matmul(W, scaling_diag_matrix)
             U, S, VT = torch.linalg.svd(W_scale, full_matrices=False)
-            num_s_after_trunc = int(W.shape[0] * W.shape[1] * ratio / (W.shape[0] + W.shape[1]))
+            num_s_after_trunc = int(W.shape[0] * W.shape[1] * ratio_i / (W.shape[0] + W.shape[1]))
             truc_s = S[:num_s_after_trunc]
             truc_u = U[:, :num_s_after_trunc]
-            if g_inv_sqrt is not None:
+            if g_blocks is not None:
+                for b in g_blocks:
+                    s, e = b["start"], b["end"]
+                    truc_u[s:e, :] = b["g_inv_sqrt"].matmul(truc_u[s:e, :])
+            elif g_inv_sqrt is not None:
                 truc_u = g_inv_sqrt.unsqueeze(1) * truc_u
             truc_v = torch.matmul(VT[:num_s_after_trunc, :], scaling_matrix_inv)
             truc_sigma = torch.diag(truc_s)
@@ -354,7 +507,7 @@ def whitening(model_name, model, profiling_mat, ratio, dev, grad_diag=None, grad
 
 
 @torch.no_grad()
-def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, dev, direct_update=False, grad_diag=None, grad_eps=1e-6):
+def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, dev, direct_update=False, grad_diag=None, grad_eps=1e-6, layer_ratios=None):
     print("Start SVD decomposition then update...")
     use_cache = model.config.use_cache
     model.config.use_cache = False
@@ -408,6 +561,7 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
         position_ids = cache['position_ids']
     for i in tqdm(range(len(layers))):
         layer = layers[i].to(dev)
+        ratio_i = layer_ratios[i] if layer_ratios is not None else ratio
         subset = find_layers(layer)
         gpts = {}
         if "llama" in model_name or "vicuna" in model_name:
@@ -427,7 +581,7 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
                 g_diag = grad_diag[i][name].to(dev)
             else:
                 g_diag = None
-            gpts[name] = local_update(subset[name], scaling_diag_matrix = scaling_diag_matrix, ratio=ratio, name=name, direct_update=direct_update, g_diag=g_diag, grad_eps=grad_eps)
+            gpts[name] = local_update(subset[name], scaling_diag_matrix = scaling_diag_matrix, ratio=ratio_i, name=name, direct_update=direct_update, g_diag=g_diag, grad_eps=grad_eps)
         
         def add_batch(name):
             def tmp(_, inp, out):
@@ -523,13 +677,24 @@ class local_update:
         g_inv_sqrt = None
         self.g_sqrt = None
         self.g_inv_sqrt = None
+        self.g_blocks = None
         if g_diag is not None:
-            g_diag = g_diag.to(self.dev)
-            g_sqrt = torch.sqrt(torch.clamp(g_diag, min=grad_eps))
-            g_inv_sqrt = 1.0 / g_sqrt
-            self.g_sqrt = g_sqrt
-            self.g_inv_sqrt = g_inv_sqrt
-            W = W * g_sqrt.unsqueeze(1)
+            if isinstance(g_diag, dict) and g_diag.get("type") == "block":
+                self.g_blocks = []
+                for b in g_diag["blocks"]:
+                    s, e = b["start"], b["end"]
+                    mat = b["mat"].to(self.dev)
+                    chol = _safe_cholesky(mat, grad_eps)
+                    inv_chol = torch.linalg.inv(chol)
+                    self.g_blocks.append({"start": s, "end": e, "g_sqrt": chol, "g_inv_sqrt": inv_chol})
+                    W[s:e, :] = chol.matmul(W[s:e, :])
+            else:
+                g_diag = g_diag.to(self.dev)
+                g_sqrt = torch.sqrt(torch.clamp(g_diag, min=grad_eps))
+                g_inv_sqrt = 1.0 / g_sqrt
+                self.g_sqrt = g_sqrt
+                self.g_inv_sqrt = g_inv_sqrt
+                W = W * g_sqrt.unsqueeze(1)
         if direct_update:
             self.U, self.S, self.VT = torch.linalg.svd(W.data, full_matrices=False)
         else: 
@@ -547,7 +712,11 @@ class local_update:
         num_s_after_trunc = int(W.shape[0] * W.shape[1] * ratio / (W.shape[0] + W.shape[1]))
         self.truc_s = self.S[:num_s_after_trunc].cuda()
         self.truc_u = self.U[:, :num_s_after_trunc].cuda()
-        if g_inv_sqrt is not None:
+        if self.g_blocks is not None:
+            for b in self.g_blocks:
+                s, e = b["start"], b["end"]
+                self.truc_u[s:e, :] = b["g_inv_sqrt"].matmul(self.truc_u[s:e, :])
+        elif g_inv_sqrt is not None:
             self.truc_u = g_inv_sqrt.unsqueeze(1) * self.truc_u
         if direct_update:
             self.truc_v = self.VT[:num_s_after_trunc, :].cuda()
@@ -563,7 +732,28 @@ class local_update:
         outs = out.view(out.shape[0] * out.shape[1], out.shape[2])
         new_w = torch.matmul(self.truc_u, torch.matmul(self.truc_sigma, self.truc_v))
         new_output = inps.matmul(new_w.t())
-        if self.g_sqrt is not None:
+        if self.g_blocks is not None:
+            outs_w = outs
+            new_output_w = new_output
+            for b in self.g_blocks:
+                s, e = b["start"], b["end"]
+                outs_w[:, s:e] = outs_w[:, s:e].matmul(b["g_sqrt"].t())
+                new_output_w[:, s:e] = new_output_w[:, s:e].matmul(b["g_sqrt"].t())
+            self.error = torch.sqrt(torch.sum((outs_w - new_output_w) ** 2)).item() / torch.norm(outs_w, p='fro').item()
+            x = torch.matmul(torch.matmul(inps, self.truc_v.T), self.truc_sigma)
+            updated_uT_w = torch.linalg.lstsq(x, outs_w).solution
+            updated_uT = updated_uT_w
+            for b in self.g_blocks:
+                s, e = b["start"], b["end"]
+                updated_uT[:, s:e] = updated_uT[:, s:e].matmul(b["g_inv_sqrt"])
+            self.updated_uT = updated_uT
+            updated_output = torch.matmul(torch.matmul(torch.matmul(inps, self.truc_v.T), self.truc_sigma), self.updated_uT)
+            updated_output_w = updated_output
+            for b in self.g_blocks:
+                s, e = b["start"], b["end"]
+                updated_output_w[:, s:e] = updated_output_w[:, s:e].matmul(b["g_sqrt"].t())
+            self.updated_error = torch.sqrt(torch.sum((outs_w - updated_output_w) ** 2)).item() / torch.norm(outs_w, p='fro').item()
+        elif self.g_sqrt is not None:
             outs_w = outs * self.g_sqrt
             new_output_w = new_output * self.g_sqrt
             self.error = torch.sqrt(torch.sum((outs_w - new_output_w) ** 2)).item() / torch.norm(outs_w, p='fro').item()
@@ -611,6 +801,12 @@ if __name__ == '__main__':
     parser.add_argument('--grad_nsamples', type=int, default=None, help='Number of calibration batches for grad diag estimation')
     parser.add_argument('--grad_path', type=str, default=None, help='Local path to load grad diag (G) matrices')
     parser.add_argument('--grad_eps', type=float, default=1e-6, help='Epsilon to avoid zero in grad diag')
+    parser.add_argument('--g_block_diag', action='store_true', help='use block-diagonal G (head blocks + MLP groups)')
+    parser.add_argument('--attn_block_size', type=int, default=0, help='attention block size (0 uses head_dim)')
+    parser.add_argument('--mlp_block_size', type=int, default=256, help='MLP block size')
+    parser.add_argument('--use_layerwise_ratio', action='store_true', help='allocate per-layer ratios based on G importance')
+    parser.add_argument('--layer_ratio_min', type=float, default=0.01, help='Minimum per-layer keep ratio')
+    parser.add_argument('--layer_ratio_max', type=float, default=0.99, help='Maximum per-layer keep ratio')
     parser.add_argument('--seed',type=int, default=0, help='Seed for sampling the calibration data')
     parser.add_argument('--DEV', type=str, default="cuda", help='device')
     parser.add_argument('--model_seq_len', type=int, default=2048, help='the default sequence length of the LLM')
@@ -625,6 +821,7 @@ if __name__ == '__main__':
         model, tokenizer = get_model_from_huggingface(model_id=args.model)
         model = model.eval()
         grad_diag = None
+        layer_ratios = None
         if args.profiling_mat_path is None:
             cali_white_data = get_calib_train_data(args.dataset, tokenizer, args.whitening_nsamples, seqlen=args.model_seq_len)
             profiling_mat = profle_svdllm_low_resource(args.model, model, cali_white_data, args.DEV)
@@ -632,17 +829,22 @@ if __name__ == '__main__':
                 torch.save(profiling_mat, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_profiling_'+ args.dataset + '_' + str(args.whitening_nsamples)  + '_' + str(args.seed)+ '.pt')
         else:
             profiling_mat = torch.load(args.profiling_mat_path)
-        if args.use_grad_g:
+        if args.use_grad_g or args.use_layerwise_ratio:
             if args.grad_path is not None:
                 grad_diag = torch.load(args.grad_path)
             else:
                 grad_nsamples = args.grad_nsamples if args.grad_nsamples is not None else args.whitening_nsamples
                 if "cali_white_data" not in locals():
                     cali_white_data = get_calib_train_data(args.dataset, tokenizer, args.whitening_nsamples, seqlen=args.model_seq_len)
-                grad_diag = profile_grad_diag(args.model, model, cali_white_data, args.DEV, max_batches=grad_nsamples, grad_eps=args.grad_eps)
+                grad_diag = profile_grad_diag(
+                    args.model, model, cali_white_data, args.DEV, max_batches=grad_nsamples, grad_eps=args.grad_eps,
+                    block_diag=args.g_block_diag, attn_block_size=args.attn_block_size, mlp_block_size=args.mlp_block_size,
+                )
                 if args.save_path is not None:
                     torch.save(grad_diag, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_grad_diag_'+ args.dataset + '_' + str(grad_nsamples)  + '_' + str(args.seed)+ '.pt')
-        whitening(args.model, model, profiling_mat, args.ratio, args.DEV, grad_diag=grad_diag, grad_eps=args.grad_eps)
+        if args.use_layerwise_ratio:
+            layer_ratios = compute_layer_ratios(args.model, model, grad_diag, args.ratio, min_ratio=args.layer_ratio_min, max_ratio=args.layer_ratio_max, eps=args.grad_eps)
+        whitening(args.model, model, profiling_mat, args.ratio, args.DEV, grad_diag=grad_diag if args.use_grad_g else None, grad_eps=args.grad_eps, layer_ratios=layer_ratios)
         if args.save_path is not None:
             torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_only_' + str(args.ratio) + '.pt')   # fp32
     elif args.step == 2:
@@ -651,6 +853,7 @@ if __name__ == '__main__':
         model = model.eval()
         model = model.float()  # need to set to float
         grad_diag = None
+        layer_ratios = None
         if args.profiling_mat_path is None:
             cali_white_data = get_calib_train_data(args.dataset, tokenizer, args.whitening_nsamples, seqlen=args.model_seq_len)
             profiling_mat = profle_svdllm_low_resource(args.model, model, cali_white_data, args.DEV)
@@ -658,17 +861,22 @@ if __name__ == '__main__':
                 torch.save(profiling_mat, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_profiling_'+ args.dataset + '_' + str(args.whitening_nsamples)  + '_' + str(args.seed)+ '.pt')
         else:
             profiling_mat = torch.load(args.profiling_mat_path)
-        if args.use_grad_g:
+        if args.use_grad_g or args.use_layerwise_ratio:
             if args.grad_path is not None:
                 grad_diag = torch.load(args.grad_path)
             else:
                 grad_nsamples = args.grad_nsamples if args.grad_nsamples is not None else args.whitening_nsamples
                 if "cali_white_data" not in locals():
                     cali_white_data = get_calib_train_data(args.dataset, tokenizer, args.whitening_nsamples, seqlen=args.model_seq_len)
-                grad_diag = profile_grad_diag(args.model, model, cali_white_data, args.DEV, max_batches=grad_nsamples, grad_eps=args.grad_eps)
+                grad_diag = profile_grad_diag(
+                    args.model, model, cali_white_data, args.DEV, max_batches=grad_nsamples, grad_eps=args.grad_eps,
+                    block_diag=args.g_block_diag, attn_block_size=args.attn_block_size, mlp_block_size=args.mlp_block_size,
+                )
                 if args.save_path is not None:
                     torch.save(grad_diag, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_grad_diag_'+ args.dataset + '_' + str(grad_nsamples)  + '_' + str(args.seed)+ '.pt')
-        whitening_local_update(args.model, model, dataloader, profiling_mat, args.ratio, args.DEV, grad_diag=grad_diag, grad_eps=args.grad_eps)
+        if args.use_layerwise_ratio:
+            layer_ratios = compute_layer_ratios(args.model, model, grad_diag, args.ratio, min_ratio=args.layer_ratio_min, max_ratio=args.layer_ratio_max, eps=args.grad_eps)
+        whitening_local_update(args.model, model, dataloader, profiling_mat, args.ratio, args.DEV, grad_diag=grad_diag if args.use_grad_g else None, grad_eps=args.grad_eps, layer_ratios=layer_ratios)
         if args.save_path is not None:
             torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_then_update_' + str(args.ratio) + '.pt')  # fp32
     elif args.step == 3:
@@ -677,16 +885,22 @@ if __name__ == '__main__':
         model = model.float()
         dataloader, _ = get_loaders(args.dataset, nsamples=args.updating_nsamples, seed=args.seed, tokenizer=tokenizer, seqlen=args.model_seq_len)
         grad_diag = None
-        if args.use_grad_g:
+        layer_ratios = None
+        if args.use_grad_g or args.use_layerwise_ratio:
             if args.grad_path is not None:
                 grad_diag = torch.load(args.grad_path)
             else:
                 grad_nsamples = args.grad_nsamples if args.grad_nsamples is not None else args.whitening_nsamples
                 cali_white_data = get_calib_train_data(args.dataset, tokenizer, args.whitening_nsamples, seqlen=args.model_seq_len)
-                grad_diag = profile_grad_diag(args.model, model, cali_white_data, args.DEV, max_batches=grad_nsamples, grad_eps=args.grad_eps)
+                grad_diag = profile_grad_diag(
+                    args.model, model, cali_white_data, args.DEV, max_batches=grad_nsamples, grad_eps=args.grad_eps,
+                    block_diag=args.g_block_diag, attn_block_size=args.attn_block_size, mlp_block_size=args.mlp_block_size,
+                )
                 if args.save_path is not None:
                     torch.save(grad_diag, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_grad_diag_'+ args.dataset + '_' + str(grad_nsamples)  + '_' + str(args.seed)+ '.pt')
-        whitening_local_update(model_name=args.model, model=model, dataloader=dataloader, profiling_mat=None, ratio=args.ratio, dev=args.DEV, direct_update=True, grad_diag=grad_diag, grad_eps=args.grad_eps)
+        if args.use_layerwise_ratio:
+            layer_ratios = compute_layer_ratios(args.model, model, grad_diag, args.ratio, min_ratio=args.layer_ratio_min, max_ratio=args.layer_ratio_max, eps=args.grad_eps)
+        whitening_local_update(model_name=args.model, model=model, dataloader=dataloader, profiling_mat=None, ratio=args.ratio, dev=args.DEV, direct_update=True, grad_diag=grad_diag if args.use_grad_g else None, grad_eps=args.grad_eps, layer_ratios=layer_ratios)
         if args.save_path is not None:
             torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_update_only_' + str(args.ratio) + '.pt')   # fp32
     elif args.step >= 4:
