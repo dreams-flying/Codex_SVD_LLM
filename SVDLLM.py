@@ -418,15 +418,18 @@ def profile_module_spectrum(model_name, model, profiling_mat, dev, grad_diag=Non
         subset = find_layers(layer)
         layer_spec = {}
         for name in subset:
-            W = subset[name].weight.data.float().to(dev)
+            # clone to avoid any accidental in-place modification of model weights
+            W = subset[name].weight.data.float().to(dev).clone()
             if grad_diag is not None and i in grad_diag and name in grad_diag[i]:
                 entry = grad_diag[i][name]
                 if isinstance(entry, dict) and entry.get("type") == "block":
+                    W_scaled = W.clone()
                     for b in entry["blocks"]:
                         s, e = b["start"], b["end"]
                         mat = b["mat"].to(dev)
                         chol = _safe_cholesky(mat, grad_eps)
-                        W[s:e, :] = chol.matmul(W[s:e, :])
+                        W_scaled[s:e, :] = chol.matmul(W[s:e, :])
+                    W = W_scaled
                 else:
                     g_diag = entry.to(dev)
                     g_sqrt = torch.sqrt(torch.clamp(g_diag, min=grad_eps))
