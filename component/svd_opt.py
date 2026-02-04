@@ -96,6 +96,7 @@ class SVDOPTAttention(nn.Module):
         config: OPTConfig,
         is_decoder: bool = False,
         ratio=1,
+        ranks=None,
         **kwargs,
     ):
         super().__init__()
@@ -134,28 +135,46 @@ class SVDOPTAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.is_decoder = is_decoder
 
-        if self.ratio != 1:
-            low_rank = int(self.embed_dim * self.ratio/2)
-            self.q_u_proj = nn.Linear(low_rank, self.embed_dim, bias=self.enable_bias)
-            self.q_v_proj = nn.Linear(self.embed_dim, low_rank, bias=False)
+        def _rank(name, default):
+            if ranks is None or name not in ranks:
+                return None
+            r = int(ranks[name])
+            return max(1, min(r, self.embed_dim))
+        default_rank = int(self.embed_dim * self.ratio / 2)
+
+        q_rank = _rank("q_proj", default_rank)
+        if q_rank is None and self.ratio != 1:
+            q_rank = default_rank
+        if q_rank is not None:
+            self.q_u_proj = nn.Linear(q_rank, self.embed_dim, bias=self.enable_bias)
+            self.q_v_proj = nn.Linear(self.embed_dim, q_rank, bias=False)
         else:
             self.q_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=self.enable_bias)
-        if self.ratio != 1:
-            low_rank = int(self.embed_dim * self.ratio/2)
-            self.k_u_proj = nn.Linear(low_rank, self.embed_dim, bias=self.enable_bias)
-            self.k_v_proj = nn.Linear(self.embed_dim, low_rank, bias=False)
+
+        k_rank = _rank("k_proj", default_rank)
+        if k_rank is None and self.ratio != 1:
+            k_rank = default_rank
+        if k_rank is not None:
+            self.k_u_proj = nn.Linear(k_rank, self.embed_dim, bias=self.enable_bias)
+            self.k_v_proj = nn.Linear(self.embed_dim, k_rank, bias=False)
         else:
             self.k_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=self.enable_bias)
-        if self.ratio != 1:
-            low_rank = int(self.embed_dim * self.ratio/2)
-            self.v_u_proj = nn.Linear(low_rank, self.embed_dim, bias=self.enable_bias)
-            self.v_v_proj = nn.Linear(self.embed_dim, low_rank, bias=False)
+
+        v_rank = _rank("v_proj", default_rank)
+        if v_rank is None and self.ratio != 1:
+            v_rank = default_rank
+        if v_rank is not None:
+            self.v_u_proj = nn.Linear(v_rank, self.embed_dim, bias=self.enable_bias)
+            self.v_v_proj = nn.Linear(self.embed_dim, v_rank, bias=False)
         else:
             self.v_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=self.enable_bias)
-        if self.ratio != 1:
-            low_rank = int(self.embed_dim * self.ratio/2)
-            self.out_u_proj = nn.Linear(low_rank, self.embed_dim, bias=self.enable_bias)
-            self.out_v_proj = nn.Linear(self.embed_dim, low_rank, bias=False)
+
+        out_rank = _rank("out_proj", default_rank)
+        if out_rank is None and self.ratio != 1:
+            out_rank = default_rank
+        if out_rank is not None:
+            self.out_u_proj = nn.Linear(out_rank, self.embed_dim, bias=self.enable_bias)
+            self.out_v_proj = nn.Linear(self.embed_dim, out_rank, bias=False)
         else:
             self.out_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=self.enable_bias)
 
@@ -180,7 +199,7 @@ class SVDOPTAttention(nn.Module):
         bsz, tgt_len, _ = hidden_states.size()
 
         # get query proj
-        if self.ratio != 1:
+        if hasattr(self, "q_u_proj"):
             query_states = self.q_u_proj(self.q_v_proj(hidden_states)) * self.scaling
         else:
             query_states = self.q_proj(hidden_states) * self.scaling
@@ -191,21 +210,21 @@ class SVDOPTAttention(nn.Module):
             value_states = past_key_value[1]
         elif is_cross_attention:
             # cross_attentions
-            if self.ratio != 1:
+            if hasattr(self, "k_u_proj"):
                 key_states = self._shape(self.k_u_proj(self.k_v_proj(key_value_states)), -1, bsz)
             else:
                 key_states = self._shape(self.k_proj(key_value_states), -1, bsz)
-            if self.ratio != 1:
+            if hasattr(self, "v_u_proj"):
                 value_states = self._shape(self.v_u_proj(self.v_v_proj(key_value_states)), -1, bsz)
             else:
                 value_states = self._shape(self.v_proj(key_value_states), -1, bsz)
         elif past_key_value is not None:
             # reuse k, v, self_attention
-            if self.ratio != 1:
+            if hasattr(self, "k_u_proj"):
                 key_states = self._shape(self.k_u_proj(self.k_v_proj(hidden_states)), -1, bsz)
             else:
                 key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
-            if self.ratio != 1:
+            if hasattr(self, "v_u_proj"):
                 value_states = self._shape(self.v_u_proj(self.v_v_proj(hidden_states)), -1, bsz)
             else:
                 value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
@@ -213,11 +232,11 @@ class SVDOPTAttention(nn.Module):
             value_states = torch.cat([past_key_value[1], value_states], dim=2)
         else:
             # self_attention
-            if self.ratio != 1:
+            if hasattr(self, "k_u_proj"):
                 key_states = self._shape(self.k_u_proj(self.k_v_proj(hidden_states)), -1, bsz)
             else:
                 key_states = self._shape(self.k_proj(hidden_states), -1, bsz)
-            if self.ratio != 1:
+            if hasattr(self, "v_u_proj"):
                 value_states = self._shape(self.v_u_proj(self.v_v_proj(hidden_states)), -1, bsz)
             else:
                 value_states = self._shape(self.v_proj(hidden_states), -1, bsz)
@@ -299,7 +318,7 @@ class SVDOPTAttention(nn.Module):
         # partitioned aross GPUs when using tensor-parallelism.
         attn_output = attn_output.reshape(bsz, tgt_len, self.embed_dim)
 
-        if self.ratio != 1:
+        if hasattr(self, "out_u_proj"):
             attn_output = self.out_u_proj(self.out_v_proj(attn_output))
         else:
             attn_output = self.out_proj(attn_output)
@@ -309,11 +328,16 @@ class SVDOPTAttention(nn.Module):
 
 
 class SVDOPTDecoderLayer(nn.Module):
-    def __init__(self, config: OPTConfig, ratio = 1):
+    def __init__(self, config: OPTConfig, ratio = 1, ranks=None):
         super().__init__()
         self.embed_dim = config.hidden_size
 
-        self.self_attn = SVDOPTAttention(config=config, ratio=ratio, is_decoder=True)
+        attn_ranks = None
+        mlp_ranks = None
+        if ranks:
+            attn_ranks = {k: v for k, v in ranks.items() if k in ("q_proj", "k_proj", "v_proj", "out_proj")}
+            mlp_ranks = {k: v for k, v in ranks.items() if k in ("fc1", "fc2")}
+        self.self_attn = SVDOPTAttention(config=config, ratio=ratio, is_decoder=True, ranks=attn_ranks)
 
         self.do_layer_norm_before = config.do_layer_norm_before
         self.dropout = config.dropout
@@ -323,16 +347,28 @@ class SVDOPTDecoderLayer(nn.Module):
             self.embed_dim, elementwise_affine=config.layer_norm_elementwise_affine
         )
         self.ratio = ratio
-        if self.ratio != 1:
-            low_rank = int(config.ffn_dim * self.embed_dim * self.ratio / (config.ffn_dim + self.embed_dim))
-            self.fc1_u_proj = nn.Linear(low_rank, config.ffn_dim, bias=config.enable_bias)
-            self.fc1_v_proj = nn.Linear(self.embed_dim, low_rank, bias=False)
+        def _rank(name, default):
+            if mlp_ranks is None or name not in mlp_ranks:
+                return None
+            r = int(mlp_ranks[name])
+            return max(1, min(r, min(self.embed_dim, config.ffn_dim)))
+        default_rank = int(config.ffn_dim * self.embed_dim * self.ratio / (config.ffn_dim + self.embed_dim))
+
+        fc1_rank = _rank("fc1", default_rank)
+        if fc1_rank is None and self.ratio != 1:
+            fc1_rank = default_rank
+        if fc1_rank is not None:
+            self.fc1_u_proj = nn.Linear(fc1_rank, config.ffn_dim, bias=config.enable_bias)
+            self.fc1_v_proj = nn.Linear(self.embed_dim, fc1_rank, bias=False)
         else:
             self.fc1 = nn.Linear(self.embed_dim, config.ffn_dim, bias=config.enable_bias)
-        if self.ratio != 1:
-            low_rank = int(config.ffn_dim * self.embed_dim * self.ratio / (config.ffn_dim + self.embed_dim))
-            self.fc2_u_proj = nn.Linear(low_rank, self.embed_dim, bias=config.enable_bias)
-            self.fc2_v_proj = nn.Linear(config.ffn_dim, low_rank, bias=False)
+
+        fc2_rank = _rank("fc2", default_rank)
+        if fc2_rank is None and self.ratio != 1:
+            fc2_rank = default_rank
+        if fc2_rank is not None:
+            self.fc2_u_proj = nn.Linear(fc2_rank, self.embed_dim, bias=config.enable_bias)
+            self.fc2_v_proj = nn.Linear(config.ffn_dim, fc2_rank, bias=False)
         else:
             self.fc2 = nn.Linear(config.ffn_dim, self.embed_dim, bias=config.enable_bias)
         self.final_layer_norm = nn.LayerNorm(self.embed_dim, elementwise_affine=config.layer_norm_elementwise_affine)
@@ -392,13 +428,13 @@ class SVDOPTDecoderLayer(nn.Module):
         if self.do_layer_norm_before:
             hidden_states = self.final_layer_norm(hidden_states)
 
-        if self.ratio != 1:
+        if hasattr(self, "fc1_u_proj"):
             hidden_states = self.fc1_u_proj(self.fc1_v_proj(hidden_states))
         else:
             hidden_states = self.fc1(hidden_states)
         hidden_states = self.activation_fn(hidden_states)
 
-        if self.ratio != 1:
+        if hasattr(self, "fc2_u_proj"):
             hidden_states = self.fc2_u_proj(self.fc2_v_proj(hidden_states))
         else:
             hidden_states = self.fc2(hidden_states)
@@ -419,4 +455,3 @@ class SVDOPTDecoderLayer(nn.Module):
             outputs += (present_key_value,)
 
         return outputs
-

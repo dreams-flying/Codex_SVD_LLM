@@ -89,19 +89,30 @@ class SVD_LlamaMLP(nn.Module):
         hidden_size: int,
         intermediate_size: int,
         hidden_act: str,
-        ratio=1
+        ratio=1,
+        ranks=None
     ):
         super().__init__()
         self.ratio = ratio
         low_rank = int(intermediate_size * hidden_size * self.ratio / (intermediate_size + hidden_size))
-        self.gate_u_proj = nn.Linear(low_rank, intermediate_size, bias=False)
-        self.gate_v_proj = nn.Linear(hidden_size, low_rank, bias=False)
+        def _rank(name, default, in_dim, out_dim):
+            if ranks is None or name not in ranks:
+                r = default
+            else:
+                r = int(ranks[name])
+            r = max(1, min(r, min(in_dim, out_dim)))
+            return r
+        gate_rank = _rank("gate_proj", low_rank, hidden_size, intermediate_size)
+        up_rank = _rank("up_proj", low_rank, hidden_size, intermediate_size)
+        down_rank = _rank("down_proj", low_rank, intermediate_size, hidden_size)
+        self.gate_u_proj = nn.Linear(gate_rank, intermediate_size, bias=False)
+        self.gate_v_proj = nn.Linear(hidden_size, gate_rank, bias=False)
         
-        self.down_u_proj = nn.Linear(low_rank, hidden_size, bias=False)
-        self.down_v_proj = nn.Linear(intermediate_size, low_rank, bias=False)
+        self.down_u_proj = nn.Linear(down_rank, hidden_size, bias=False)
+        self.down_v_proj = nn.Linear(intermediate_size, down_rank, bias=False)
         
-        self.up_u_proj = nn.Linear(low_rank, intermediate_size, bias=False)
-        self.up_v_proj = nn.Linear(hidden_size, low_rank, bias=False)
+        self.up_u_proj = nn.Linear(up_rank, intermediate_size, bias=False)
+        self.up_v_proj = nn.Linear(hidden_size, up_rank, bias=False)
         self.act_fn = ACT2FN[hidden_act]
 
     def forward(self, x):
@@ -113,7 +124,7 @@ class SVD_LlamaMLP(nn.Module):
 class SVD_LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: LlamaConfig, ratio=1):
+    def __init__(self, config: LlamaConfig, ratio=1, ranks=None):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
@@ -128,17 +139,28 @@ class SVD_LlamaAttention(nn.Module):
                 f" and `num_heads`: {self.num_heads})."
             )
         low_rank = int(self.hidden_size * self.ratio/2)
-        self.q_u_proj = nn.Linear(low_rank, self.num_heads * self.head_dim, bias=False)
-        self.q_v_proj = nn.Linear(self.hidden_size, low_rank, bias=False)
+        def _rank(name, default):
+            if ranks is None or name not in ranks:
+                r = default
+            else:
+                r = int(ranks[name])
+            r = max(1, min(r, self.hidden_size))
+            return r
+        q_rank = _rank("q_proj", low_rank)
+        k_rank = _rank("k_proj", low_rank)
+        v_rank = _rank("v_proj", low_rank)
+        o_rank = _rank("o_proj", low_rank)
+        self.q_u_proj = nn.Linear(q_rank, self.num_heads * self.head_dim, bias=False)
+        self.q_v_proj = nn.Linear(self.hidden_size, q_rank, bias=False)
 
-        self.k_u_proj = nn.Linear(low_rank, self.num_heads * self.head_dim, bias=False)
-        self.k_v_proj = nn.Linear(self.hidden_size, low_rank, bias=False)
+        self.k_u_proj = nn.Linear(k_rank, self.num_heads * self.head_dim, bias=False)
+        self.k_v_proj = nn.Linear(self.hidden_size, k_rank, bias=False)
 
-        self.v_u_proj = nn.Linear(low_rank, self.num_heads * self.head_dim, bias=False)
-        self.v_v_proj = nn.Linear(self.hidden_size, low_rank, bias=False)
+        self.v_u_proj = nn.Linear(v_rank, self.num_heads * self.head_dim, bias=False)
+        self.v_v_proj = nn.Linear(self.hidden_size, v_rank, bias=False)
 
-        self.o_u_proj = nn.Linear(low_rank, self.hidden_size, bias=False)
-        self.o_v_proj = nn.Linear(self.num_heads * self.head_dim, low_rank, bias=False)
+        self.o_u_proj = nn.Linear(o_rank, self.hidden_size, bias=False)
+        self.o_v_proj = nn.Linear(self.num_heads * self.head_dim, o_rank, bias=False)
 
         self.rotary_emb = LlamaRotaryEmbedding(self.head_dim, max_position_embeddings=self.max_position_embeddings)
 
