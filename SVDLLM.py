@@ -716,6 +716,13 @@ def _module_rank_overrides(args):
     return overrides if overrides else None
 
 
+def _save_model_fp16(model, tokenizer, path):
+    prev_dtype = next(iter(model.parameters())).dtype
+    model = model.to(torch.float16)
+    torch.save({'model': model, 'tokenizer': tokenizer}, path)
+    model = model.to(prev_dtype)
+
+
 def _spectrum_meta(args, grad_nsamples, grad_seq_len):
     return {
         "model": args.model,
@@ -1313,7 +1320,7 @@ if __name__ == '__main__':
             layer_ratios = None
         whitening(args.model, model, profiling_mat, args.ratio, args.DEV, grad_diag=grad_diag if args.use_grad_g else None, grad_eps=args.grad_eps, layer_ratios=layer_ratios, module_ranks=module_ranks, grad_inv_max=args.grad_inv_max)
         if args.save_path is not None:
-            torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_only_' + str(args.ratio) + '.pt')   # fp32
+            _save_model_fp16(model, tokenizer, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_only_' + str(args.ratio) + '.pt')
     elif args.step == 2:
         model, tokenizer = get_model_from_huggingface(model_id=args.model)
         dataloader, _ = get_loaders(args.dataset, nsamples=args.updating_nsamples, seed=args.seed, tokenizer=tokenizer, seqlen=args.model_seq_len)
@@ -1409,7 +1416,7 @@ if __name__ == '__main__':
             layer_ratios = None
         whitening_local_update(args.model, model, dataloader, profiling_mat, args.ratio, args.DEV, grad_diag=grad_diag if args.use_grad_g else None, grad_eps=args.grad_eps, layer_ratios=layer_ratios, module_ranks=module_ranks, grad_inv_max=args.grad_inv_max)
         if args.save_path is not None:
-            torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_then_update_' + str(args.ratio) + '.pt')  # fp32
+            _save_model_fp16(model, tokenizer, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_then_update_' + str(args.ratio) + '.pt')
     elif args.step == 3:
         model, tokenizer = get_model_from_huggingface(args.model)
         model = model.eval()
@@ -1498,7 +1505,7 @@ if __name__ == '__main__':
             layer_ratios = None
         whitening_local_update(model_name=args.model, model=model, dataloader=dataloader, profiling_mat=None, ratio=args.ratio, dev=args.DEV, direct_update=True, grad_diag=grad_diag if args.use_grad_g else None, grad_eps=args.grad_eps, layer_ratios=layer_ratios, module_ranks=module_ranks, grad_inv_max=args.grad_inv_max)
         if args.save_path is not None:
-            torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_update_only_' + str(args.ratio) + '.pt')   # fp32
+            _save_model_fp16(model, tokenizer, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_update_only_' + str(args.ratio) + '.pt')
     elif args.step >= 4:
         print(f"evaluating {args.model_path}...")
         if args.model_path == "original":
