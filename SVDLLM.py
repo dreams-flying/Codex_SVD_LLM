@@ -207,13 +207,23 @@ def _get_block_size(name, model, attn_block_size, mlp_block_size):
     return 0
 
 
-def profile_grad_diag(model_name, model, calib_loader, dev, max_batches=None, grad_eps=1e-6, block_diag=False, attn_block_size=0, mlp_block_size=0):
+def profile_grad_diag(model_name, model, calib_loader, dev, max_batches=None, grad_eps=1e-6, block_diag=False, attn_block_size=0, mlp_block_size=0, use_checkpointing=False):
     if "llama" in model_name or "mistral" in model_name or "vicuna" in model_name:
         layers = model.model.layers
     elif "opt" in model_name:
         layers = model.model.decoder.layers
     model = model.to(dev)
-    model.eval()
+    prev_training = model.training
+    prev_use_cache = getattr(model.config, "use_cache", None)
+    if prev_use_cache is not None:
+        model.config.use_cache = False
+    prev_grad_ckpt = getattr(model, "is_gradient_checkpointing", False) or getattr(model, "gradient_checkpointing", False)
+    if use_checkpointing and hasattr(model, "gradient_checkpointing_enable") and not prev_grad_ckpt:
+        model.gradient_checkpointing_enable()
+    if use_checkpointing:
+        model.train()
+    else:
+        model.eval()
     prev_grad = torch.is_grad_enabled()
     torch.set_grad_enabled(True)
 
@@ -268,7 +278,7 @@ def profile_grad_diag(model_name, model, calib_loader, dev, max_batches=None, gr
         model.zero_grad(set_to_none=True)
         batch = {k: v.to(dev) for k, v in batch.items()}
         labels = batch["input_ids"]
-        outputs = model(**batch, labels=labels)
+        outputs = model(**batch, labels=labels, use_cache=False, output_attentions=False, output_hidden_states=False)
         loss = outputs.loss
         loss.backward()
         model.zero_grad(set_to_none=True)
@@ -302,6 +312,11 @@ def profile_grad_diag(model_name, model, calib_loader, dev, max_batches=None, gr
                 del module.grad_squares_count
         grad_diag[i] = layer_profile
     model = model.cpu()
+    if use_checkpointing and hasattr(model, "gradient_checkpointing_disable") and not prev_grad_ckpt:
+        model.gradient_checkpointing_disable()
+    if prev_use_cache is not None:
+        model.config.use_cache = prev_use_cache
+    model.train(prev_training)
     torch.set_grad_enabled(prev_grad)
     return grad_diag
 
@@ -801,6 +816,9 @@ if __name__ == '__main__':
     parser.add_argument('--grad_nsamples', type=int, default=None, help='Number of calibration batches for grad diag estimation')
     parser.add_argument('--grad_path', type=str, default=None, help='Local path to load grad diag (G) matrices')
     parser.add_argument('--grad_eps', type=float, default=1e-6, help='Epsilon to avoid zero in grad diag')
+    parser.add_argument('--grad_seq_len', type=int, default=None, help='Sequence length for grad diag profiling (defaults to model_seq_len)')
+    parser.add_argument('--grad_batch_size', type=int, default=None, help='Batch size for grad diag profiling (defaults to 1)')
+    parser.add_argument('--grad_checkpointing', action='store_true', help='Enable gradient checkpointing for grad diag profiling to reduce memory')
     parser.add_argument('--g_block_diag', action='store_true', help='use block-diagonal G (head blocks + MLP groups)')
     parser.add_argument('--attn_block_size', type=int, default=0, help='attention block size (0 uses head_dim)')
     parser.add_argument('--mlp_block_size', type=int, default=256, help='MLP block size')
@@ -834,11 +852,16 @@ if __name__ == '__main__':
                 grad_diag = torch.load(args.grad_path)
             else:
                 grad_nsamples = args.grad_nsamples if args.grad_nsamples is not None else args.whitening_nsamples
-                if "cali_white_data" not in locals():
-                    cali_white_data = get_calib_train_data(args.dataset, tokenizer, args.whitening_nsamples, seqlen=args.model_seq_len)
+                grad_seq_len = args.grad_seq_len if args.grad_seq_len is not None else args.model_seq_len
+                grad_batch_size = args.grad_batch_size if args.grad_batch_size is not None else 1
+                if "cali_white_data" in locals() and grad_seq_len == args.model_seq_len and grad_batch_size == 1:
+                    cali_grad_data = cali_white_data
+                else:
+                    cali_grad_data = get_calib_train_data(args.dataset, tokenizer, args.whitening_nsamples, seqlen=grad_seq_len, batch_size=grad_batch_size)
                 grad_diag = profile_grad_diag(
-                    args.model, model, cali_white_data, args.DEV, max_batches=grad_nsamples, grad_eps=args.grad_eps,
+                    args.model, model, cali_grad_data, args.DEV, max_batches=grad_nsamples, grad_eps=args.grad_eps,
                     block_diag=args.g_block_diag, attn_block_size=args.attn_block_size, mlp_block_size=args.mlp_block_size,
+                    use_checkpointing=args.grad_checkpointing,
                 )
                 if args.save_path is not None:
                     torch.save(grad_diag, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_grad_diag_'+ args.dataset + '_' + str(grad_nsamples)  + '_' + str(args.seed)+ '.pt')
@@ -866,11 +889,16 @@ if __name__ == '__main__':
                 grad_diag = torch.load(args.grad_path)
             else:
                 grad_nsamples = args.grad_nsamples if args.grad_nsamples is not None else args.whitening_nsamples
-                if "cali_white_data" not in locals():
-                    cali_white_data = get_calib_train_data(args.dataset, tokenizer, args.whitening_nsamples, seqlen=args.model_seq_len)
+                grad_seq_len = args.grad_seq_len if args.grad_seq_len is not None else args.model_seq_len
+                grad_batch_size = args.grad_batch_size if args.grad_batch_size is not None else 1
+                if "cali_white_data" in locals() and grad_seq_len == args.model_seq_len and grad_batch_size == 1:
+                    cali_grad_data = cali_white_data
+                else:
+                    cali_grad_data = get_calib_train_data(args.dataset, tokenizer, args.whitening_nsamples, seqlen=grad_seq_len, batch_size=grad_batch_size)
                 grad_diag = profile_grad_diag(
-                    args.model, model, cali_white_data, args.DEV, max_batches=grad_nsamples, grad_eps=args.grad_eps,
+                    args.model, model, cali_grad_data, args.DEV, max_batches=grad_nsamples, grad_eps=args.grad_eps,
                     block_diag=args.g_block_diag, attn_block_size=args.attn_block_size, mlp_block_size=args.mlp_block_size,
+                    use_checkpointing=args.grad_checkpointing,
                 )
                 if args.save_path is not None:
                     torch.save(grad_diag, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_grad_diag_'+ args.dataset + '_' + str(grad_nsamples)  + '_' + str(args.seed)+ '.pt')
@@ -891,10 +919,16 @@ if __name__ == '__main__':
                 grad_diag = torch.load(args.grad_path)
             else:
                 grad_nsamples = args.grad_nsamples if args.grad_nsamples is not None else args.whitening_nsamples
-                cali_white_data = get_calib_train_data(args.dataset, tokenizer, args.whitening_nsamples, seqlen=args.model_seq_len)
+                grad_seq_len = args.grad_seq_len if args.grad_seq_len is not None else args.model_seq_len
+                grad_batch_size = args.grad_batch_size if args.grad_batch_size is not None else 1
+                if "cali_white_data" in locals() and grad_seq_len == args.model_seq_len and grad_batch_size == 1:
+                    cali_grad_data = cali_white_data
+                else:
+                    cali_grad_data = get_calib_train_data(args.dataset, tokenizer, args.whitening_nsamples, seqlen=grad_seq_len, batch_size=grad_batch_size)
                 grad_diag = profile_grad_diag(
-                    args.model, model, cali_white_data, args.DEV, max_batches=grad_nsamples, grad_eps=args.grad_eps,
+                    args.model, model, cali_grad_data, args.DEV, max_batches=grad_nsamples, grad_eps=args.grad_eps,
                     block_diag=args.g_block_diag, attn_block_size=args.attn_block_size, mlp_block_size=args.mlp_block_size,
+                    use_checkpointing=args.grad_checkpointing,
                 )
                 if args.save_path is not None:
                     torch.save(grad_diag, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_grad_diag_'+ args.dataset + '_' + str(grad_nsamples)  + '_' + str(args.seed)+ '.pt')
