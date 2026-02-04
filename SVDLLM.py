@@ -451,13 +451,25 @@ def profile_module_spectrum(model_name, model, profiling_mat, dev, grad_diag=Non
     return spectra
 
 
-def allocate_module_ranks(spectra, target_ratio, min_rank=1, max_rank=None, eps=1e-12):
+def allocate_module_ranks(spectra, target_ratio, min_rank=1, max_rank=None, min_rank_overrides=None, layer_floor_ratio=0.0, eps=1e-12):
     if spectra is None:
         return None, 0.0
     entries = []
     total_full = 0
     min_total = 0
     max_score = 0.0
+    def _pick_min_rank(name, base):
+        if not min_rank_overrides:
+            return base
+        if "o_proj" in name or "out_proj" in name:
+            return min_rank_overrides.get("o_proj", base)
+        if "down_proj" in name:
+            return min_rank_overrides.get("down_proj", base)
+        if "q_proj" in name or "k_proj" in name or "v_proj" in name:
+            return min_rank_overrides.get("qkv", min_rank_overrides.get("attn", base))
+        if "gate_proj" in name or "up_proj" in name:
+            return min_rank_overrides.get("mlp", base)
+        return base
     for layer_id in spectra:
         for name, info in spectra[layer_id].items():
             m, n = info["shape"]
@@ -467,7 +479,8 @@ def allocate_module_ranks(spectra, target_ratio, min_rank=1, max_rank=None, eps=
                 continue
             cost = m + n
             total_full += m * n
-            r_min = min_rank if min_rank is not None else 1
+            base_min = min_rank if min_rank is not None else 1
+            r_min = _pick_min_rank(name, base_min)
             r_min = max(1, min(r_min, k_max))
             min_total += r_min * cost
             if s2.numel() > 0:
@@ -479,9 +492,52 @@ def allocate_module_ranks(spectra, target_ratio, min_rank=1, max_rank=None, eps=
                 "cost": cost,
                 "k_max": k_max,
                 "r_min": r_min,
+                "m": m,
+                "n": n,
             })
     if total_full <= 0:
         return None, 0.0
+
+    # Enforce per-layer floor by increasing r_min within each layer.
+    if layer_floor_ratio and layer_floor_ratio > 0:
+        by_layer = {}
+        for entry in entries:
+            by_layer.setdefault(entry["layer"], []).append(entry)
+        for layer_id, layer_entries in by_layer.items():
+            layer_full = sum(e["m"] * e["n"] for e in layer_entries)
+            if layer_full <= 0:
+                continue
+            required = layer_floor_ratio * layer_full
+            current = sum(e["r_min"] * e["cost"] for e in layer_entries)
+            if current >= required:
+                continue
+            heap = []
+            cur_k = {}
+            entry_by_id = {id(e): e for e in layer_entries}
+            for e in layer_entries:
+                k = e["r_min"]
+                cur_k[id(e)] = k
+                if k < e["k_max"]:
+                    score = float((e["s2"][k] / e["cost"]).item())
+                    heapq.heappush(heap, (-score, id(e)))
+            while heap and current < required:
+                _, key = heapq.heappop(heap)
+                e = entry_by_id[key]
+                k = cur_k[key] + 1
+                if k > e["k_max"]:
+                    continue
+                cur_k[key] = k
+                current += e["cost"]
+                if k < e["k_max"]:
+                    score = float((e["s2"][k] / e["cost"]).item())
+                    heapq.heappush(heap, (-score, key))
+            # apply updated r_min
+            for e in layer_entries:
+                new_r = cur_k[id(e)]
+                if new_r > e["r_min"]:
+                    min_total += (new_r - e["r_min"]) * e["cost"]
+                    e["r_min"] = new_r
+
     target_params = target_ratio * total_full
     if min_total > target_params + eps:
         print(f"Warning: min_rank budget {min_total} exceeds target params {target_params:.2f}. Using min_rank.")
@@ -643,6 +699,21 @@ def _default_spectrum_path(save_path, model_name, dataset, nsamples, seed):
     safe_model = model_name.replace("/", "_").replace("-", "_")
     filename = f"{safe_model}_spectrum_{dataset}_{nsamples}_{seed}.pt"
     return os.path.join(save_path, filename)
+
+
+def _module_rank_overrides(args):
+    overrides = {}
+    if args.module_rank_min_attn is not None:
+        overrides["attn"] = args.module_rank_min_attn
+    if args.module_rank_min_qkv is not None:
+        overrides["qkv"] = args.module_rank_min_qkv
+    if args.module_rank_min_o is not None:
+        overrides["o_proj"] = args.module_rank_min_o
+    if args.module_rank_min_mlp is not None:
+        overrides["mlp"] = args.module_rank_min_mlp
+    if args.module_rank_min_down is not None:
+        overrides["down_proj"] = args.module_rank_min_down
+    return overrides if overrides else None
 
 
 def _spectrum_meta(args, grad_nsamples, grad_seq_len):
@@ -1130,6 +1201,12 @@ if __name__ == '__main__':
     parser.add_argument('--use_module_rank_allocation', action='store_true', help='Allocate per-module ranks via spectrum + Lagrange')
     parser.add_argument('--spectrum_path', type=str, default=None, help='Path to load/save module spectrum cache')
     parser.add_argument('--module_rank_min', type=int, default=1, help='Minimum rank per module')
+    parser.add_argument('--module_rank_min_attn', type=int, default=None, help='Minimum rank for attention proj modules')
+    parser.add_argument('--module_rank_min_qkv', type=int, default=None, help='Minimum rank for q/k/v proj modules')
+    parser.add_argument('--module_rank_min_o', type=int, default=None, help='Minimum rank for o/out proj modules')
+    parser.add_argument('--module_rank_min_mlp', type=int, default=None, help='Minimum rank for gate/up proj modules')
+    parser.add_argument('--module_rank_min_down', type=int, default=None, help='Minimum rank for down proj modules')
+    parser.add_argument('--layer_ratio_floor', type=float, default=0.0, help='Minimum per-layer keep ratio when allocating module ranks')
     parser.add_argument('--module_rank_max', type=int, default=None, help='Maximum rank per module (default: min(out,in))')
     parser.add_argument('--print_module_ranks', action='store_true', help='Print per-module ranks and per-layer effective ratios')
     parser.add_argument('--grad_inv_max', type=float, default=None, help='Clamp max value of g_inv_sqrt to avoid huge scaling')
@@ -1209,7 +1286,12 @@ if __name__ == '__main__':
                     meta = _spectrum_meta(args, grad_nsamples, grad_seq_len)
                     torch.save({"meta": meta, "spectra": spectrum}, spectrum_path)
             module_ranks, effective_ratio = allocate_module_ranks(
-                spectrum, args.ratio, min_rank=args.module_rank_min, max_rank=args.module_rank_max
+                spectrum,
+                args.ratio,
+                min_rank=args.module_rank_min,
+                max_rank=args.module_rank_max,
+                min_rank_overrides=_module_rank_overrides(args),
+                layer_floor_ratio=args.layer_ratio_floor,
             )
             if args.print_module_ranks and module_ranks is not None:
                 effective_ratio, layer_stats = summarize_module_ranks(spectrum, module_ranks)
@@ -1300,7 +1382,12 @@ if __name__ == '__main__':
                     meta = _spectrum_meta(args, grad_nsamples, grad_seq_len)
                     torch.save({"meta": meta, "spectra": spectrum}, spectrum_path)
             module_ranks, effective_ratio = allocate_module_ranks(
-                spectrum, args.ratio, min_rank=args.module_rank_min, max_rank=args.module_rank_max
+                spectrum,
+                args.ratio,
+                min_rank=args.module_rank_min,
+                max_rank=args.module_rank_max,
+                min_rank_overrides=_module_rank_overrides(args),
+                layer_floor_ratio=args.layer_ratio_floor,
             )
             if args.print_module_ranks and module_ranks is not None:
                 effective_ratio, layer_stats = summarize_module_ranks(spectrum, module_ranks)
@@ -1384,7 +1471,12 @@ if __name__ == '__main__':
                     meta = _spectrum_meta(args, grad_nsamples, grad_seq_len)
                     torch.save({"meta": meta, "spectra": spectrum}, spectrum_path)
             module_ranks, effective_ratio = allocate_module_ranks(
-                spectrum, args.ratio, min_rank=args.module_rank_min, max_rank=args.module_rank_max
+                spectrum,
+                args.ratio,
+                min_rank=args.module_rank_min,
+                max_rank=args.module_rank_max,
+                min_rank_overrides=_module_rank_overrides(args),
+                layer_floor_ratio=args.layer_ratio_floor,
             )
             if args.print_module_ranks and module_ranks is not None:
                 effective_ratio, layer_stats = summarize_module_ranks(spectrum, module_ranks)
