@@ -215,9 +215,15 @@ def profile_grad_diag(model_name, model, calib_loader, dev, max_batches=None, gr
     model = model.to(dev)
     prev_training = model.training
     prev_use_cache = getattr(model.config, "use_cache", None)
+    prev_dropout_cfg = {}
     if prev_use_cache is not None:
         model.config.use_cache = False
     prev_grad_ckpt = getattr(model, "is_gradient_checkpointing", False) or getattr(model, "gradient_checkpointing", False)
+    if use_checkpointing:
+        for key in ("attention_dropout", "hidden_dropout", "dropout", "activation_dropout", "classifier_dropout"):
+            if hasattr(model.config, key):
+                prev_dropout_cfg[key] = getattr(model.config, key)
+                setattr(model.config, key, 0.0)
     if use_checkpointing and hasattr(model, "gradient_checkpointing_enable") and not prev_grad_ckpt:
         model.gradient_checkpointing_enable()
     if use_checkpointing:
@@ -314,6 +320,8 @@ def profile_grad_diag(model_name, model, calib_loader, dev, max_batches=None, gr
     model = model.cpu()
     if use_checkpointing and hasattr(model, "gradient_checkpointing_disable") and not prev_grad_ckpt:
         model.gradient_checkpointing_disable()
+    for key, value in prev_dropout_cfg.items():
+        setattr(model.config, key, value)
     if prev_use_cache is not None:
         model.config.use_cache = prev_use_cache
     model.train(prev_training)
@@ -392,6 +400,37 @@ def compute_layer_ratios(model_name, model, grad_diag, base_ratio, min_ratio=0.0
         if not updated:
             break
     return ratios
+
+
+def _layer_param_sizes(model_name, model):
+    if "llama" in model_name or "mistral" in model_name or "vicuna" in model_name:
+        layers = model.model.layers
+    elif "opt" in model_name:
+        layers = model.model.decoder.layers
+    else:
+        return None
+    sizes = []
+    for i in range(len(layers)):
+        subset = find_layers(layers[i])
+        size_i = 0
+        for name in subset:
+            W = subset[name].weight
+            size_i += W.shape[0] * W.shape[1]
+        sizes.append(size_i)
+    return sizes
+
+
+def _normalize_layer_ratios(ratios, layer_sizes, target_ratio, eps=1e-12):
+    total = sum(layer_sizes)
+    if total <= 0:
+        return ratios, 0.0
+    effective = sum(s * r for s, r in zip(layer_sizes, ratios)) / total
+    if abs(effective - target_ratio) <= eps:
+        return ratios, effective
+    scale = target_ratio / max(effective, eps)
+    ratios = [r * scale for r in ratios]
+    effective = sum(s * r for s, r in zip(layer_sizes, ratios)) / total
+    return ratios, effective
      
  
 @torch.no_grad()
@@ -825,6 +864,8 @@ if __name__ == '__main__':
     parser.add_argument('--use_layerwise_ratio', action='store_true', help='allocate per-layer ratios based on G importance')
     parser.add_argument('--layer_ratio_min', type=float, default=0.01, help='Minimum per-layer keep ratio')
     parser.add_argument('--layer_ratio_max', type=float, default=0.99, help='Maximum per-layer keep ratio')
+    parser.add_argument('--layer_ratio_strict', action='store_true', help='Rescale layer ratios to exactly match the global keep ratio')
+    parser.add_argument('--print_layer_ratios', action='store_true', help='Print per-layer keep ratios and effective global ratio')
     parser.add_argument('--seed',type=int, default=0, help='Seed for sampling the calibration data')
     parser.add_argument('--DEV', type=str, default="cuda", help='device')
     parser.add_argument('--model_seq_len', type=int, default=2048, help='the default sequence length of the LLM')
@@ -867,6 +908,16 @@ if __name__ == '__main__':
                     torch.save(grad_diag, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_grad_diag_'+ args.dataset + '_' + str(grad_nsamples)  + '_' + str(args.seed)+ '.pt')
         if args.use_layerwise_ratio:
             layer_ratios = compute_layer_ratios(args.model, model, grad_diag, args.ratio, min_ratio=args.layer_ratio_min, max_ratio=args.layer_ratio_max, eps=args.grad_eps)
+            layer_sizes = _layer_param_sizes(args.model, model)
+            if layer_ratios is not None and layer_sizes is not None:
+                if args.layer_ratio_strict:
+                    layer_ratios, effective_ratio = _normalize_layer_ratios(layer_ratios, layer_sizes, args.ratio)
+                else:
+                    _, effective_ratio = _normalize_layer_ratios(layer_ratios, layer_sizes, args.ratio)
+                if args.print_layer_ratios:
+                    print(f"Layerwise keep ratios (target={args.ratio:.6f}, effective={effective_ratio:.6f})")
+                    for i, r in enumerate(layer_ratios):
+                        print(f"layer {i:02d} ratio={r:.6f} size={layer_sizes[i]}")
         whitening(args.model, model, profiling_mat, args.ratio, args.DEV, grad_diag=grad_diag if args.use_grad_g else None, grad_eps=args.grad_eps, layer_ratios=layer_ratios)
         if args.save_path is not None:
             torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_only_' + str(args.ratio) + '.pt')   # fp32
@@ -904,6 +955,16 @@ if __name__ == '__main__':
                     torch.save(grad_diag, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_grad_diag_'+ args.dataset + '_' + str(grad_nsamples)  + '_' + str(args.seed)+ '.pt')
         if args.use_layerwise_ratio:
             layer_ratios = compute_layer_ratios(args.model, model, grad_diag, args.ratio, min_ratio=args.layer_ratio_min, max_ratio=args.layer_ratio_max, eps=args.grad_eps)
+            layer_sizes = _layer_param_sizes(args.model, model)
+            if layer_ratios is not None and layer_sizes is not None:
+                if args.layer_ratio_strict:
+                    layer_ratios, effective_ratio = _normalize_layer_ratios(layer_ratios, layer_sizes, args.ratio)
+                else:
+                    _, effective_ratio = _normalize_layer_ratios(layer_ratios, layer_sizes, args.ratio)
+                if args.print_layer_ratios:
+                    print(f"Layerwise keep ratios (target={args.ratio:.6f}, effective={effective_ratio:.6f})")
+                    for i, r in enumerate(layer_ratios):
+                        print(f"layer {i:02d} ratio={r:.6f} size={layer_sizes[i]}")
         whitening_local_update(args.model, model, dataloader, profiling_mat, args.ratio, args.DEV, grad_diag=grad_diag if args.use_grad_g else None, grad_eps=args.grad_eps, layer_ratios=layer_ratios)
         if args.save_path is not None:
             torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_then_update_' + str(args.ratio) + '.pt')  # fp32
@@ -934,6 +995,16 @@ if __name__ == '__main__':
                     torch.save(grad_diag, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") + '_grad_diag_'+ args.dataset + '_' + str(grad_nsamples)  + '_' + str(args.seed)+ '.pt')
         if args.use_layerwise_ratio:
             layer_ratios = compute_layer_ratios(args.model, model, grad_diag, args.ratio, min_ratio=args.layer_ratio_min, max_ratio=args.layer_ratio_max, eps=args.grad_eps)
+            layer_sizes = _layer_param_sizes(args.model, model)
+            if layer_ratios is not None and layer_sizes is not None:
+                if args.layer_ratio_strict:
+                    layer_ratios, effective_ratio = _normalize_layer_ratios(layer_ratios, layer_sizes, args.ratio)
+                else:
+                    _, effective_ratio = _normalize_layer_ratios(layer_ratios, layer_sizes, args.ratio)
+                if args.print_layer_ratios:
+                    print(f"Layerwise keep ratios (target={args.ratio:.6f}, effective={effective_ratio:.6f})")
+                    for i, r in enumerate(layer_ratios):
+                        print(f"layer {i:02d} ratio={r:.6f} size={layer_sizes[i]}")
         whitening_local_update(model_name=args.model, model=model, dataloader=dataloader, profiling_mat=None, ratio=args.ratio, dev=args.DEV, direct_update=True, grad_diag=grad_diag if args.use_grad_g else None, grad_eps=args.grad_eps, layer_ratios=layer_ratios)
         if args.save_path is not None:
             torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_update_only_' + str(args.ratio) + '.pt')   # fp32
