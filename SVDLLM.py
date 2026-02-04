@@ -674,7 +674,7 @@ def _load_spectrum(path, expected_meta=None):
      
  
 @torch.no_grad()
-def whitening(model_name, model, profiling_mat, ratio, dev, grad_diag=None, grad_eps=1e-6, layer_ratios=None, module_ranks=None):
+def whitening(model_name, model, profiling_mat, ratio, dev, grad_diag=None, grad_eps=1e-6, layer_ratios=None, module_ranks=None, grad_inv_max=None):
     model.eval()
     if 'opt' in model_name:
         layers = model.model.decoder.layers
@@ -711,12 +711,16 @@ def whitening(model_name, model, profiling_mat, ratio, dev, grad_diag=None, grad
                         mat = b["mat"].to(dev)
                         chol = _safe_cholesky(mat, grad_eps)
                         inv_chol = torch.linalg.inv(chol)
+                        if grad_inv_max is not None:
+                            inv_chol = torch.clamp(inv_chol, min=-grad_inv_max, max=grad_inv_max)
                         g_blocks.append({"start": s, "end": e, "g_sqrt": chol, "g_inv_sqrt": inv_chol})
                         W[s:e, :] = chol.matmul(W[s:e, :])
                 else:
                     g_diag = entry.to(dev)
                     g_sqrt = torch.sqrt(torch.clamp(g_diag, min=grad_eps))
                     g_inv_sqrt = 1.0 / g_sqrt
+                    if grad_inv_max is not None:
+                        g_inv_sqrt = torch.clamp(g_inv_sqrt, max=grad_inv_max)
                     W = W * g_sqrt.unsqueeze(1)
             scaling_diag_matrix = profiling_mat[i][name].to(dev)
             try:
@@ -807,7 +811,7 @@ def whitening(model_name, model, profiling_mat, ratio, dev, grad_diag=None, grad
 
 
 @torch.no_grad()
-def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, dev, direct_update=False, grad_diag=None, grad_eps=1e-6, layer_ratios=None, module_ranks=None):
+def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, dev, direct_update=False, grad_diag=None, grad_eps=1e-6, layer_ratios=None, module_ranks=None, grad_inv_max=None):
     print("Start SVD decomposition then update...")
     use_cache = model.config.use_cache
     model.config.use_cache = False
@@ -884,7 +888,7 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
             else:
                 g_diag = None
             rank_override = ranks_layer[name] if ranks_layer is not None and name in ranks_layer else None
-            gpts[name] = local_update(subset[name], scaling_diag_matrix = scaling_diag_matrix, ratio=ratio_i, name=name, direct_update=direct_update, g_diag=g_diag, grad_eps=grad_eps, rank=rank_override)
+            gpts[name] = local_update(subset[name], scaling_diag_matrix = scaling_diag_matrix, ratio=ratio_i, name=name, direct_update=direct_update, g_diag=g_diag, grad_eps=grad_eps, rank=rank_override, grad_inv_max=grad_inv_max)
         
         def add_batch(name):
             def tmp(_, inp, out):
@@ -969,7 +973,7 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
 
 
 class local_update:
-    def __init__(self, layer, scaling_diag_matrix, ratio, name, direct_update=False, g_diag=None, grad_eps=1e-6, rank=None):
+    def __init__(self, layer, scaling_diag_matrix, ratio, name, direct_update=False, g_diag=None, grad_eps=1e-6, rank=None, grad_inv_max=None):
         self.layer = layer
         self.name = name
         self.dev = self.layer.weight.device
@@ -989,12 +993,16 @@ class local_update:
                     mat = b["mat"].to(self.dev)
                     chol = _safe_cholesky(mat, grad_eps)
                     inv_chol = torch.linalg.inv(chol)
+                    if grad_inv_max is not None:
+                        inv_chol = torch.clamp(inv_chol, min=-grad_inv_max, max=grad_inv_max)
                     self.g_blocks.append({"start": s, "end": e, "g_sqrt": chol, "g_inv_sqrt": inv_chol})
                     W[s:e, :] = chol.matmul(W[s:e, :])
             else:
                 g_diag = g_diag.to(self.dev)
                 g_sqrt = torch.sqrt(torch.clamp(g_diag, min=grad_eps))
                 g_inv_sqrt = 1.0 / g_sqrt
+                if grad_inv_max is not None:
+                    g_inv_sqrt = torch.clamp(g_inv_sqrt, max=grad_inv_max)
                 self.g_sqrt = g_sqrt
                 self.g_inv_sqrt = g_inv_sqrt
                 W = W * g_sqrt.unsqueeze(1)
@@ -1124,6 +1132,7 @@ if __name__ == '__main__':
     parser.add_argument('--module_rank_min', type=int, default=1, help='Minimum rank per module')
     parser.add_argument('--module_rank_max', type=int, default=None, help='Maximum rank per module (default: min(out,in))')
     parser.add_argument('--print_module_ranks', action='store_true', help='Print per-module ranks and per-layer effective ratios')
+    parser.add_argument('--grad_inv_max', type=float, default=None, help='Clamp max value of g_inv_sqrt to avoid huge scaling')
     parser.add_argument('--seed',type=int, default=0, help='Seed for sampling the calibration data')
     parser.add_argument('--DEV', type=str, default="cuda", help='device')
     parser.add_argument('--model_seq_len', type=int, default=2048, help='the default sequence length of the LLM')
@@ -1207,12 +1216,20 @@ if __name__ == '__main__':
                 print(f"Module ranks (target={args.ratio:.6f}, effective={effective_ratio:.6f})")
                 for layer_id in sorted(layer_stats.keys()):
                     print(f"layer {layer_id:02d} ratio={layer_stats[layer_id]:.6f}")
+                ranks_flat = []
                 for layer_id in sorted(module_ranks.keys()):
                     for name, k in module_ranks[layer_id].items():
                         shape = spectrum[layer_id][name]["shape"]
                         print(f"layer {layer_id:02d} {name} rank={k} shape={shape}")
+                        ranks_flat.append(k)
+                if ranks_flat:
+                    ranks_flat = sorted(ranks_flat)
+                    print(f"rank stats: min={ranks_flat[0]} p50={ranks_flat[len(ranks_flat)//2]} max={ranks_flat[-1]}")
+                    tiny = sum(1 for r in ranks_flat if r <= 1)
+                    if tiny > 0:
+                        print(f"Warning: {tiny} modules have rank<=1. Consider increasing --module_rank_min.")
             layer_ratios = None
-        whitening(args.model, model, profiling_mat, args.ratio, args.DEV, grad_diag=grad_diag if args.use_grad_g else None, grad_eps=args.grad_eps, layer_ratios=layer_ratios, module_ranks=module_ranks)
+        whitening(args.model, model, profiling_mat, args.ratio, args.DEV, grad_diag=grad_diag if args.use_grad_g else None, grad_eps=args.grad_eps, layer_ratios=layer_ratios, module_ranks=module_ranks, grad_inv_max=args.grad_inv_max)
         if args.save_path is not None:
             torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_only_' + str(args.ratio) + '.pt')   # fp32
     elif args.step == 2:
@@ -1290,12 +1307,20 @@ if __name__ == '__main__':
                 print(f"Module ranks (target={args.ratio:.6f}, effective={effective_ratio:.6f})")
                 for layer_id in sorted(layer_stats.keys()):
                     print(f"layer {layer_id:02d} ratio={layer_stats[layer_id]:.6f}")
+                ranks_flat = []
                 for layer_id in sorted(module_ranks.keys()):
                     for name, k in module_ranks[layer_id].items():
                         shape = spectrum[layer_id][name]["shape"]
                         print(f"layer {layer_id:02d} {name} rank={k} shape={shape}")
+                        ranks_flat.append(k)
+                if ranks_flat:
+                    ranks_flat = sorted(ranks_flat)
+                    print(f"rank stats: min={ranks_flat[0]} p50={ranks_flat[len(ranks_flat)//2]} max={ranks_flat[-1]}")
+                    tiny = sum(1 for r in ranks_flat if r <= 1)
+                    if tiny > 0:
+                        print(f"Warning: {tiny} modules have rank<=1. Consider increasing --module_rank_min.")
             layer_ratios = None
-        whitening_local_update(args.model, model, dataloader, profiling_mat, args.ratio, args.DEV, grad_diag=grad_diag if args.use_grad_g else None, grad_eps=args.grad_eps, layer_ratios=layer_ratios, module_ranks=module_ranks)
+        whitening_local_update(args.model, model, dataloader, profiling_mat, args.ratio, args.DEV, grad_diag=grad_diag if args.use_grad_g else None, grad_eps=args.grad_eps, layer_ratios=layer_ratios, module_ranks=module_ranks, grad_inv_max=args.grad_inv_max)
         if args.save_path is not None:
             torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_then_update_' + str(args.ratio) + '.pt')  # fp32
     elif args.step == 3:
@@ -1366,12 +1391,20 @@ if __name__ == '__main__':
                 print(f"Module ranks (target={args.ratio:.6f}, effective={effective_ratio:.6f})")
                 for layer_id in sorted(layer_stats.keys()):
                     print(f"layer {layer_id:02d} ratio={layer_stats[layer_id]:.6f}")
+                ranks_flat = []
                 for layer_id in sorted(module_ranks.keys()):
                     for name, k in module_ranks[layer_id].items():
                         shape = spectrum[layer_id][name]["shape"]
                         print(f"layer {layer_id:02d} {name} rank={k} shape={shape}")
+                        ranks_flat.append(k)
+                if ranks_flat:
+                    ranks_flat = sorted(ranks_flat)
+                    print(f"rank stats: min={ranks_flat[0]} p50={ranks_flat[len(ranks_flat)//2]} max={ranks_flat[-1]}")
+                    tiny = sum(1 for r in ranks_flat if r <= 1)
+                    if tiny > 0:
+                        print(f"Warning: {tiny} modules have rank<=1. Consider increasing --module_rank_min.")
             layer_ratios = None
-        whitening_local_update(model_name=args.model, model=model, dataloader=dataloader, profiling_mat=None, ratio=args.ratio, dev=args.DEV, direct_update=True, grad_diag=grad_diag if args.use_grad_g else None, grad_eps=args.grad_eps, layer_ratios=layer_ratios, module_ranks=module_ranks)
+        whitening_local_update(model_name=args.model, model=model, dataloader=dataloader, profiling_mat=None, ratio=args.ratio, dev=args.DEV, direct_update=True, grad_diag=grad_diag if args.use_grad_g else None, grad_eps=args.grad_eps, layer_ratios=layer_ratios, module_ranks=module_ranks, grad_inv_max=args.grad_inv_max)
         if args.save_path is not None:
             torch.save({'model': model, 'tokenizer': tokenizer}, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_update_only_' + str(args.ratio) + '.pt')   # fp32
     elif args.step >= 4:
