@@ -643,6 +643,34 @@ def _default_spectrum_path(save_path, model_name, dataset, nsamples, seed):
     safe_model = model_name.replace("/", "_").replace("-", "_")
     filename = f"{safe_model}_spectrum_{dataset}_{nsamples}_{seed}.pt"
     return os.path.join(save_path, filename)
+
+
+def _spectrum_meta(args, grad_nsamples, grad_seq_len):
+    return {
+        "model": args.model,
+        "dataset": args.dataset,
+        "whitening_nsamples": args.whitening_nsamples,
+        "grad_nsamples": grad_nsamples,
+        "model_seq_len": args.model_seq_len,
+        "grad_seq_len": grad_seq_len,
+        "seed": args.seed,
+        "use_grad_g": bool(args.use_grad_g),
+        "g_block_diag": bool(args.g_block_diag),
+        "attn_block_size": int(args.attn_block_size),
+        "mlp_block_size": int(args.mlp_block_size),
+    }
+
+
+def _load_spectrum(path, expected_meta=None):
+    data = torch.load(path)
+    if isinstance(data, dict) and "spectra" in data:
+        meta = data.get("meta")
+        spectra = data.get("spectra")
+        if expected_meta is not None and meta != expected_meta:
+            return None, False
+        return spectra, True
+    # Backward-compatible: raw spectra dict
+    return data, True
      
  
 @torch.no_grad()
@@ -1151,18 +1179,26 @@ if __name__ == '__main__':
                         print(f"layer {i:02d} ratio={r:.6f} size={layer_sizes[i]}")
         if args.use_module_rank_allocation:
             grad_nsamples = args.grad_nsamples if args.grad_nsamples is not None else args.whitening_nsamples
+            grad_seq_len = args.grad_seq_len if args.grad_seq_len is not None else args.model_seq_len
             spectrum_path = args.spectrum_path
             if spectrum_path is None and args.save_path is not None:
                 spectrum_path = _default_spectrum_path(args.save_path, args.model, args.dataset, grad_nsamples, args.seed)
             if spectrum_path is not None and os.path.exists(spectrum_path):
-                spectrum = torch.load(spectrum_path)
+                expected_meta = _spectrum_meta(args, grad_nsamples, grad_seq_len)
+                spectrum, ok = _load_spectrum(spectrum_path, expected_meta)
+                if not ok:
+                    print("Warning: spectrum cache meta mismatch, recomputing...")
+                    spectrum = None
             else:
+                spectrum = None
+            if spectrum is None:
                 spectrum = profile_module_spectrum(
                     args.model, model, profiling_mat, args.DEV,
-                    grad_diag=grad_diag, grad_eps=args.grad_eps,
+                    grad_diag=grad_diag if args.use_grad_g else None, grad_eps=args.grad_eps,
                 )
                 if spectrum_path is not None:
-                    torch.save(spectrum, spectrum_path)
+                    meta = _spectrum_meta(args, grad_nsamples, grad_seq_len)
+                    torch.save({"meta": meta, "spectra": spectrum}, spectrum_path)
             module_ranks, effective_ratio = allocate_module_ranks(
                 spectrum, args.ratio, min_rank=args.module_rank_min, max_rank=args.module_rank_max
             )
@@ -1226,18 +1262,26 @@ if __name__ == '__main__':
                         print(f"layer {i:02d} ratio={r:.6f} size={layer_sizes[i]}")
         if args.use_module_rank_allocation:
             grad_nsamples = args.grad_nsamples if args.grad_nsamples is not None else args.whitening_nsamples
+            grad_seq_len = args.grad_seq_len if args.grad_seq_len is not None else args.model_seq_len
             spectrum_path = args.spectrum_path
             if spectrum_path is None and args.save_path is not None:
                 spectrum_path = _default_spectrum_path(args.save_path, args.model, args.dataset, grad_nsamples, args.seed)
             if spectrum_path is not None and os.path.exists(spectrum_path):
-                spectrum = torch.load(spectrum_path)
+                expected_meta = _spectrum_meta(args, grad_nsamples, grad_seq_len)
+                spectrum, ok = _load_spectrum(spectrum_path, expected_meta)
+                if not ok:
+                    print("Warning: spectrum cache meta mismatch, recomputing...")
+                    spectrum = None
             else:
+                spectrum = None
+            if spectrum is None:
                 spectrum = profile_module_spectrum(
                     args.model, model, profiling_mat, args.DEV,
-                    grad_diag=grad_diag, grad_eps=args.grad_eps,
+                    grad_diag=grad_diag if args.use_grad_g else None, grad_eps=args.grad_eps,
                 )
                 if spectrum_path is not None:
-                    torch.save(spectrum, spectrum_path)
+                    meta = _spectrum_meta(args, grad_nsamples, grad_seq_len)
+                    torch.save({"meta": meta, "spectra": spectrum}, spectrum_path)
             module_ranks, effective_ratio = allocate_module_ranks(
                 spectrum, args.ratio, min_rank=args.module_rank_min, max_rank=args.module_rank_max
             )
@@ -1294,18 +1338,26 @@ if __name__ == '__main__':
                         print(f"layer {i:02d} ratio={r:.6f} size={layer_sizes[i]}")
         if args.use_module_rank_allocation:
             grad_nsamples = args.grad_nsamples if args.grad_nsamples is not None else args.whitening_nsamples
+            grad_seq_len = args.grad_seq_len if args.grad_seq_len is not None else args.model_seq_len
             spectrum_path = args.spectrum_path
             if spectrum_path is None and args.save_path is not None:
                 spectrum_path = _default_spectrum_path(args.save_path, args.model, args.dataset, grad_nsamples, args.seed)
             if spectrum_path is not None and os.path.exists(spectrum_path):
-                spectrum = torch.load(spectrum_path)
+                expected_meta = _spectrum_meta(args, grad_nsamples, grad_seq_len)
+                spectrum, ok = _load_spectrum(spectrum_path, expected_meta)
+                if not ok:
+                    print("Warning: spectrum cache meta mismatch, recomputing...")
+                    spectrum = None
             else:
+                spectrum = None
+            if spectrum is None:
                 spectrum = profile_module_spectrum(
                     args.model, model, profiling_mat=None, dev=args.DEV,
-                    grad_diag=grad_diag, grad_eps=args.grad_eps,
+                    grad_diag=grad_diag if args.use_grad_g else None, grad_eps=args.grad_eps,
                 )
                 if spectrum_path is not None:
-                    torch.save(spectrum, spectrum_path)
+                    meta = _spectrum_meta(args, grad_nsamples, grad_seq_len)
+                    torch.save({"meta": meta, "spectra": spectrum}, spectrum_path)
             module_ranks, effective_ratio = allocate_module_ranks(
                 spectrum, args.ratio, min_rank=args.module_rank_min, max_rank=args.module_rank_max
             )
