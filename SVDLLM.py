@@ -3,6 +3,7 @@ import os
 import sys
 import argparse
 import heapq
+import math
 import torch.jit
 from tqdm import tqdm
 import torch
@@ -191,6 +192,19 @@ def _safe_cholesky(mat, eps=1e-6):
         eig = torch.linalg.eigvalsh(mat)
         mat = mat + (-eig[0] + eps) * torch.eye(mat.shape[0], device=mat.device, dtype=mat.dtype)
         return torch.linalg.cholesky(mat)
+
+
+def _min_eig_value(grad_inv_max, grad_eps):
+    if grad_inv_max is None:
+        return grad_eps
+    return max(grad_eps, 1.0 / (grad_inv_max ** 2))
+
+
+def _shift_psd_min_eig(mat, min_eig):
+    eig = torch.linalg.eigvalsh(mat)
+    if eig[0] < min_eig:
+        mat = mat + (min_eig - eig[0]) * torch.eye(mat.shape[0], device=mat.device, dtype=mat.dtype)
+    return mat
 
 
 def _get_block_size(name, model, attn_block_size, mlp_block_size):
@@ -404,7 +418,7 @@ def compute_layer_ratios(model_name, model, grad_diag, base_ratio, min_ratio=0.0
 
 
 @torch.no_grad()
-def profile_module_spectrum(model_name, model, profiling_mat, dev, grad_diag=None, grad_eps=1e-6):
+def profile_module_spectrum(model_name, model, profiling_mat, dev, grad_diag=None, grad_eps=1e-6, grad_inv_max=None):
     if "llama" in model_name or "mistral" in model_name or "vicuna" in model_name:
         layers = model.model.layers
     elif "opt" in model_name:
@@ -427,11 +441,15 @@ def profile_module_spectrum(model_name, model, profiling_mat, dev, grad_diag=Non
                     for b in entry["blocks"]:
                         s, e = b["start"], b["end"]
                         mat = b["mat"].to(dev)
+                        min_eig = _min_eig_value(grad_inv_max, grad_eps)
+                        mat = _shift_psd_min_eig(mat, min_eig)
                         chol = _safe_cholesky(mat, grad_eps)
                         W_scaled[s:e, :] = chol.matmul(W[s:e, :])
                     W = W_scaled
                 else:
                     g_diag = entry.to(dev)
+                    min_eig = _min_eig_value(grad_inv_max, grad_eps)
+                    g_diag = torch.clamp(g_diag, min=min_eig)
                     g_sqrt = torch.sqrt(torch.clamp(g_diag, min=grad_eps))
                     W = W * g_sqrt.unsqueeze(1)
             if profiling_mat is not None:
@@ -739,6 +757,7 @@ def _spectrum_meta(args, grad_nsamples, grad_seq_len):
         "g_block_diag": bool(args.g_block_diag),
         "attn_block_size": int(args.attn_block_size),
         "mlp_block_size": int(args.mlp_block_size),
+        "grad_inv_max": args.grad_inv_max,
     }
 
 
@@ -755,7 +774,7 @@ def _load_spectrum(path, expected_meta=None):
      
  
 @torch.no_grad()
-def whitening(model_name, model, profiling_mat, ratio, dev, grad_diag=None, grad_eps=1e-6, layer_ratios=None, module_ranks=None, grad_inv_max=None):
+def whitening(model_name, model, profiling_mat, ratio, dev, grad_diag=None, grad_eps=1e-6, layer_ratios=None, module_ranks=None, grad_inv_max=None, debug_svd=False):
     model.eval()
     if 'opt' in model_name:
         layers = model.model.decoder.layers
@@ -783,26 +802,38 @@ def whitening(model_name, model, profiling_mat, ratio, dev, grad_diag=None, grad
             dtype = W.dtype
             g_inv_sqrt = None
             g_blocks = None
+            debug_g_info = ""
             if grad_diag is not None:
                 entry = grad_diag[i][name]
                 if isinstance(entry, dict) and entry.get("type") == "block":
                     g_blocks = []
+                    debug_block_min = None
+                    min_eig = _min_eig_value(grad_inv_max, grad_eps)
                     for b in entry["blocks"]:
                         s, e = b["start"], b["end"]
                         mat = b["mat"].to(dev)
+                        if debug_svd:
+                            eig = torch.linalg.eigvalsh(mat)
+                            min_raw = float(eig[0].item())
+                            debug_block_min = min_raw if debug_block_min is None else min(debug_block_min, min_raw)
+                        mat = _shift_psd_min_eig(mat, min_eig)
                         chol = _safe_cholesky(mat, grad_eps)
                         inv_chol = torch.linalg.inv(chol)
-                        if grad_inv_max is not None:
-                            inv_chol = torch.clamp(inv_chol, min=-grad_inv_max, max=grad_inv_max)
                         g_blocks.append({"start": s, "end": e, "g_sqrt": chol, "g_inv_sqrt": inv_chol})
                         W[s:e, :] = chol.matmul(W[s:e, :])
+                    if debug_svd and debug_block_min is not None:
+                        debug_g_info = f" g_block_min={debug_block_min:.3e}"
                 else:
                     g_diag = entry.to(dev)
+                    min_eig = _min_eig_value(grad_inv_max, grad_eps)
+                    g_diag = torch.clamp(g_diag, min=min_eig)
                     g_sqrt = torch.sqrt(torch.clamp(g_diag, min=grad_eps))
                     g_inv_sqrt = 1.0 / g_sqrt
-                    if grad_inv_max is not None:
-                        g_inv_sqrt = torch.clamp(g_inv_sqrt, max=grad_inv_max)
                     W = W * g_sqrt.unsqueeze(1)
+                    if debug_svd:
+                        g_min = float(g_diag.min().item())
+                        g_max = float(g_diag.max().item())
+                        debug_g_info = f" g_min={g_min:.3e} g_max={g_max:.3e}"
             scaling_diag_matrix = profiling_mat[i][name].to(dev)
             try:
                 scaling_matrix_inv = torch.linalg.inv(scaling_diag_matrix)
@@ -819,6 +850,15 @@ def whitening(model_name, model, profiling_mat, ratio, dev, grad_diag=None, grad
             else:
                 num_s_after_trunc = int(W.shape[0] * W.shape[1] * ratio_i / (W.shape[0] + W.shape[1]))
             num_s_after_trunc = max(1, min(num_s_after_trunc, min(W.shape[0], W.shape[1])))
+            if debug_svd:
+                s2 = (S.float() ** 2)
+                denom = float(s2.sum().item())
+                if denom > 0:
+                    tail = float(s2[num_s_after_trunc:].sum().item())
+                    rel_err = math.sqrt(tail / denom)
+                else:
+                    rel_err = 0.0
+                print(f"[debug] layer {i:02d} {name} k={num_s_after_trunc} rel_err={rel_err:.6f}{debug_g_info}")
             truc_s = S[:num_s_after_trunc]
             truc_u = U[:, :num_s_after_trunc]
             if g_blocks is not None:
@@ -892,7 +932,7 @@ def whitening(model_name, model, profiling_mat, ratio, dev, grad_diag=None, grad
 
 
 @torch.no_grad()
-def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, dev, direct_update=False, grad_diag=None, grad_eps=1e-6, layer_ratios=None, module_ranks=None, grad_inv_max=None):
+def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, dev, direct_update=False, grad_diag=None, grad_eps=1e-6, layer_ratios=None, module_ranks=None, grad_inv_max=None, debug_svd=False):
     print("Start SVD decomposition then update...")
     use_cache = model.config.use_cache
     model.config.use_cache = False
@@ -969,7 +1009,8 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
             else:
                 g_diag = None
             rank_override = ranks_layer[name] if ranks_layer is not None and name in ranks_layer else None
-            gpts[name] = local_update(subset[name], scaling_diag_matrix = scaling_diag_matrix, ratio=ratio_i, name=name, direct_update=direct_update, g_diag=g_diag, grad_eps=grad_eps, rank=rank_override, grad_inv_max=grad_inv_max)
+            debug_name = f"layer {i:02d} {name}" if debug_svd else name
+            gpts[name] = local_update(subset[name], scaling_diag_matrix = scaling_diag_matrix, ratio=ratio_i, name=debug_name, direct_update=direct_update, g_diag=g_diag, grad_eps=grad_eps, rank=rank_override, grad_inv_max=grad_inv_max, debug_svd=debug_svd)
         
         def add_batch(name):
             def tmp(_, inp, out):
@@ -1054,7 +1095,7 @@ def whitening_local_update(model_name, model, dataloader, profiling_mat, ratio, 
 
 
 class local_update:
-    def __init__(self, layer, scaling_diag_matrix, ratio, name, direct_update=False, g_diag=None, grad_eps=1e-6, rank=None, grad_inv_max=None):
+    def __init__(self, layer, scaling_diag_matrix, ratio, name, direct_update=False, g_diag=None, grad_eps=1e-6, rank=None, grad_inv_max=None, debug_svd=False):
         self.layer = layer
         self.name = name
         self.dev = self.layer.weight.device
@@ -1069,21 +1110,21 @@ class local_update:
         if g_diag is not None:
             if isinstance(g_diag, dict) and g_diag.get("type") == "block":
                 self.g_blocks = []
+                min_eig = _min_eig_value(grad_inv_max, grad_eps)
                 for b in g_diag["blocks"]:
                     s, e = b["start"], b["end"]
                     mat = b["mat"].to(self.dev)
+                    mat = _shift_psd_min_eig(mat, min_eig)
                     chol = _safe_cholesky(mat, grad_eps)
                     inv_chol = torch.linalg.inv(chol)
-                    if grad_inv_max is not None:
-                        inv_chol = torch.clamp(inv_chol, min=-grad_inv_max, max=grad_inv_max)
                     self.g_blocks.append({"start": s, "end": e, "g_sqrt": chol, "g_inv_sqrt": inv_chol})
                     W[s:e, :] = chol.matmul(W[s:e, :])
             else:
                 g_diag = g_diag.to(self.dev)
+                min_eig = _min_eig_value(grad_inv_max, grad_eps)
+                g_diag = torch.clamp(g_diag, min=min_eig)
                 g_sqrt = torch.sqrt(torch.clamp(g_diag, min=grad_eps))
                 g_inv_sqrt = 1.0 / g_sqrt
-                if grad_inv_max is not None:
-                    g_inv_sqrt = torch.clamp(g_inv_sqrt, max=grad_inv_max)
                 self.g_sqrt = g_sqrt
                 self.g_inv_sqrt = g_inv_sqrt
                 W = W * g_sqrt.unsqueeze(1)
@@ -1106,6 +1147,15 @@ class local_update:
         else:
             num_s_after_trunc = int(W.shape[0] * W.shape[1] * ratio / (W.shape[0] + W.shape[1]))
         num_s_after_trunc = max(1, min(num_s_after_trunc, min(W.shape[0], W.shape[1])))
+        if debug_svd:
+            s2 = (self.S.float() ** 2)
+            denom = float(s2.sum().item())
+            if denom > 0:
+                tail = float(s2[num_s_after_trunc:].sum().item())
+                rel_err = math.sqrt(tail / denom)
+            else:
+                rel_err = 0.0
+            print(f"[debug] {self.name} k={num_s_after_trunc} rel_err={rel_err:.6f}")
         self.truc_s = self.S[:num_s_after_trunc].cuda()
         self.truc_u = self.U[:, :num_s_after_trunc].cuda()
         if self.g_blocks is not None:
@@ -1220,6 +1270,7 @@ if __name__ == '__main__':
     parser.add_argument('--module_rank_max', type=int, default=None, help='Maximum rank per module (default: min(out,in))')
     parser.add_argument('--print_module_ranks', action='store_true', help='Print per-module ranks and per-layer effective ratios')
     parser.add_argument('--grad_inv_max', type=float, default=None, help='Clamp max value of g_inv_sqrt to avoid huge scaling')
+    parser.add_argument('--debug_svd', action='store_true', help='Print per-module truncation error and G stats for debugging')
     parser.add_argument('--seed',type=int, default=0, help='Seed for sampling the calibration data')
     parser.add_argument('--DEV', type=str, default="cuda", help='device')
     parser.add_argument('--model_seq_len', type=int, default=2048, help='the default sequence length of the LLM')
@@ -1290,7 +1341,7 @@ if __name__ == '__main__':
             if spectrum is None:
                 spectrum = profile_module_spectrum(
                     args.model, model, profiling_mat, args.DEV,
-                    grad_diag=grad_diag if args.use_grad_g else None, grad_eps=args.grad_eps,
+                    grad_diag=grad_diag if args.use_grad_g else None, grad_eps=args.grad_eps, grad_inv_max=args.grad_inv_max,
                 )
                 if spectrum_path is not None:
                     meta = _spectrum_meta(args, grad_nsamples, grad_seq_len)
@@ -1321,7 +1372,7 @@ if __name__ == '__main__':
                     if tiny > 0:
                         print(f"Warning: {tiny} modules have rank<=1. Consider increasing --module_rank_min.")
             layer_ratios = None
-        whitening(args.model, model, profiling_mat, args.ratio, args.DEV, grad_diag=grad_diag if args.use_grad_g else None, grad_eps=args.grad_eps, layer_ratios=layer_ratios, module_ranks=module_ranks, grad_inv_max=args.grad_inv_max)
+        whitening(args.model, model, profiling_mat, args.ratio, args.DEV, grad_diag=grad_diag if args.use_grad_g else None, grad_eps=args.grad_eps, layer_ratios=layer_ratios, module_ranks=module_ranks, grad_inv_max=args.grad_inv_max, debug_svd=args.debug_svd)
         if args.save_path is not None:
             _save_model_fp16(model, tokenizer, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_only_' + str(args.ratio) + '.pt')
     elif args.step == 2:
@@ -1386,7 +1437,7 @@ if __name__ == '__main__':
             if spectrum is None:
                 spectrum = profile_module_spectrum(
                     args.model, model, profiling_mat, args.DEV,
-                    grad_diag=grad_diag if args.use_grad_g else None, grad_eps=args.grad_eps,
+                    grad_diag=grad_diag if args.use_grad_g else None, grad_eps=args.grad_eps, grad_inv_max=args.grad_inv_max,
                 )
                 if spectrum_path is not None:
                     meta = _spectrum_meta(args, grad_nsamples, grad_seq_len)
@@ -1417,7 +1468,7 @@ if __name__ == '__main__':
                     if tiny > 0:
                         print(f"Warning: {tiny} modules have rank<=1. Consider increasing --module_rank_min.")
             layer_ratios = None
-        whitening_local_update(args.model, model, dataloader, profiling_mat, args.ratio, args.DEV, grad_diag=grad_diag if args.use_grad_g else None, grad_eps=args.grad_eps, layer_ratios=layer_ratios, module_ranks=module_ranks, grad_inv_max=args.grad_inv_max)
+        whitening_local_update(args.model, model, dataloader, profiling_mat, args.ratio, args.DEV, grad_diag=grad_diag if args.use_grad_g else None, grad_eps=args.grad_eps, layer_ratios=layer_ratios, module_ranks=module_ranks, grad_inv_max=args.grad_inv_max, debug_svd=args.debug_svd)
         if args.save_path is not None:
             _save_model_fp16(model, tokenizer, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_whitening_then_update_' + str(args.ratio) + '.pt')
     elif args.step == 3:
@@ -1475,7 +1526,7 @@ if __name__ == '__main__':
             if spectrum is None:
                 spectrum = profile_module_spectrum(
                     args.model, model, profiling_mat=None, dev=args.DEV,
-                    grad_diag=grad_diag if args.use_grad_g else None, grad_eps=args.grad_eps,
+                    grad_diag=grad_diag if args.use_grad_g else None, grad_eps=args.grad_eps, grad_inv_max=args.grad_inv_max,
                 )
                 if spectrum_path is not None:
                     meta = _spectrum_meta(args, grad_nsamples, grad_seq_len)
@@ -1506,7 +1557,7 @@ if __name__ == '__main__':
                     if tiny > 0:
                         print(f"Warning: {tiny} modules have rank<=1. Consider increasing --module_rank_min.")
             layer_ratios = None
-        whitening_local_update(model_name=args.model, model=model, dataloader=dataloader, profiling_mat=None, ratio=args.ratio, dev=args.DEV, direct_update=True, grad_diag=grad_diag if args.use_grad_g else None, grad_eps=args.grad_eps, layer_ratios=layer_ratios, module_ranks=module_ranks, grad_inv_max=args.grad_inv_max)
+        whitening_local_update(model_name=args.model, model=model, dataloader=dataloader, profiling_mat=None, ratio=args.ratio, dev=args.DEV, direct_update=True, grad_diag=grad_diag if args.use_grad_g else None, grad_eps=args.grad_eps, layer_ratios=layer_ratios, module_ranks=module_ranks, grad_inv_max=args.grad_inv_max, debug_svd=args.debug_svd)
         if args.save_path is not None:
             _save_model_fp16(model, tokenizer, args.save_path + "/" + args.model.replace("/", "_").replace("-", "_") +'_update_only_' + str(args.ratio) + '.pt')
     elif args.step >= 4:
