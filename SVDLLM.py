@@ -472,13 +472,43 @@ def profile_module_spectrum(model_name, model, profiling_mat, dev, grad_diag=Non
     return spectra
 
 
-def allocate_module_ranks(spectra, target_ratio, min_rank=1, max_rank=None, min_rank_overrides=None, layer_floor_ratio=0.0, eps=1e-12):
+def allocate_module_ranks(spectra, target_ratio, min_rank=1, max_rank=None, min_rank_overrides=None, layer_floor_ratio=0.0, qkv_multiple=None, early_layers=None, early_layers_min_qkv=None, eps=1e-12):
     if spectra is None:
         return None, 0.0
     entries = []
     total_full = 0
     min_total = 0
     max_score = 0.0
+    def _is_qkv(name):
+        return "q_proj" in name or "k_proj" in name or "v_proj" in name
+    def _ceil_multiple(val, step):
+        return int((val + step - 1) // step) * step
+    def _align_rank(k, step, k_max, cap=None):
+        if step is None or step <= 1:
+            if cap is not None:
+                k = min(k, cap)
+            return min(k, k_max)
+        if cap is not None:
+            k = min(k, cap)
+        k = min(k, k_max)
+        k = _ceil_multiple(k, step)
+        if k > k_max:
+            k = (k_max // step) * step
+        if cap is not None and k > cap:
+            k = (cap // step) * step
+        if k <= 0:
+            k = min(step, k_max)
+        return k
+    def _next_rank(k, step, k_max):
+        if step is None or step <= 1:
+            return min(k + 1, k_max)
+        return min(k + step, k_max)
+    def _block_score(s2, k, next_k, cost):
+        if s2.numel() == 0 or next_k <= k:
+            return 0.0
+        delta = next_k - k
+        block_sum = float(s2[k:next_k].sum().item())
+        return block_sum / (delta * cost)
     def _pick_min_rank(name, base):
         if not min_rank_overrides:
             return base
@@ -502,7 +532,12 @@ def allocate_module_ranks(spectra, target_ratio, min_rank=1, max_rank=None, min_
             total_full += m * n
             base_min = min_rank if min_rank is not None else 1
             r_min = _pick_min_rank(name, base_min)
+            if early_layers_min_qkv is not None and early_layers is not None:
+                if layer_id < early_layers and _is_qkv(name):
+                    r_min = max(r_min, early_layers_min_qkv)
+            step = qkv_multiple if qkv_multiple and _is_qkv(name) else 1
             r_min = max(1, min(r_min, k_max))
+            r_min = _align_rank(r_min, step, k_max, cap=max_rank)
             min_total += r_min * cost
             if s2.numel() > 0:
                 max_score = max(max_score, float((s2[0] / cost).item()))
@@ -515,6 +550,7 @@ def allocate_module_ranks(spectra, target_ratio, min_rank=1, max_rank=None, min_
                 "r_min": r_min,
                 "m": m,
                 "n": n,
+                "step": step,
             })
     if total_full <= 0:
         return None, 0.0
@@ -539,18 +575,20 @@ def allocate_module_ranks(spectra, target_ratio, min_rank=1, max_rank=None, min_
                 k = e["r_min"]
                 cur_k[id(e)] = k
                 if k < e["k_max"]:
-                    score = float((e["s2"][k] / e["cost"]).item())
+                    next_k = _next_rank(k, e["step"], e["k_max"])
+                    score = _block_score(e["s2"], k, next_k, e["cost"])
                     heapq.heappush(heap, (-score, id(e)))
             while heap and current < required:
                 _, key = heapq.heappop(heap)
                 e = entry_by_id[key]
-                k = cur_k[key] + 1
-                if k > e["k_max"]:
+                k = cur_k[key]
+                next_k = _next_rank(k, e["step"], e["k_max"])
+                if next_k <= k:
                     continue
-                cur_k[key] = k
-                current += e["cost"]
-                if k < e["k_max"]:
-                    score = float((e["s2"][k] / e["cost"]).item())
+                cur_k[key] = next_k
+                current += (next_k - k) * e["cost"]
+                if next_k < e["k_max"]:
+                    score = _block_score(e["s2"], next_k, _next_rank(next_k, e["step"], e["k_max"]), e["cost"])
                     heapq.heappush(heap, (-score, key))
             # apply updated r_min
             for e in layer_entries:
@@ -585,9 +623,9 @@ def allocate_module_ranks(spectra, target_ratio, min_rank=1, max_rank=None, min_
             else:
                 k = int((s2 / cost >= mid).sum().item())
                 k = max(k, r_min)
-                if max_rank is not None:
-                    k = min(k, max_rank)
-                k = min(k, k_max)
+                k = _align_rank(k, entry["step"], k_max, cap=max_rank)
+                if k < r_min:
+                    k = r_min
             total += k * cost
             ranks.setdefault(entry["layer"], {})[entry["name"]] = k
         if total > target_params:
@@ -611,24 +649,24 @@ def allocate_module_ranks(spectra, target_ratio, min_rank=1, max_rank=None, min_
         k = best_ranks[layer][name]
         entry_map[(layer, name)] = entry
         if k < entry["k_max"]:
-            score = float((s2[k] / cost).item())
+            next_k = _next_rank(k, entry["step"], entry["k_max"])
+            score = _block_score(s2, k, next_k, cost)
             heapq.heappush(heap, (-score, layer, name))
     while heap and total + eps < target_params:
         neg_score, layer, name = heapq.heappop(heap)
         entry = entry_map[(layer, name)]
         cost = entry["cost"]
-        if total + cost > target_params + eps:
-            break
-        k = best_ranks[layer][name] + 1
-        if max_rank is not None:
-            k = min(k, max_rank)
-        k = min(k, entry["k_max"])
-        if k == best_ranks[layer][name]:
+        k = best_ranks[layer][name]
+        next_k = _next_rank(k, entry["step"], entry["k_max"])
+        delta = next_k - k
+        if delta <= 0:
             continue
-        best_ranks[layer][name] = k
-        total += cost
-        if k < entry["k_max"]:
-            next_score = float((entry["s2"][k] / cost).item())
+        if total + delta * cost > target_params + eps:
+            break
+        best_ranks[layer][name] = next_k
+        total += delta * cost
+        if next_k < entry["k_max"]:
+            next_score = _block_score(entry["s2"], next_k, _next_rank(next_k, entry["step"], entry["k_max"]), cost)
             heapq.heappush(heap, (-next_score, layer, name))
     effective = total / total_full
     return best_ranks, effective
@@ -701,6 +739,22 @@ def _layer_param_sizes(model_name, model):
             size_i += W.shape[0] * W.shape[1]
         sizes.append(size_i)
     return sizes
+
+
+def _get_head_dim(model):
+    cfg = getattr(model, "config", None)
+    if cfg is None:
+        return None
+    head_dim = getattr(cfg, "head_dim", None)
+    if head_dim is not None:
+        return int(head_dim)
+    hidden = getattr(cfg, "hidden_size", None)
+    heads = getattr(cfg, "num_attention_heads", None)
+    if hidden is None or heads is None:
+        return None
+    if heads == 0:
+        return None
+    return int(hidden // heads)
 
 
 def _normalize_layer_ratios(ratios, layer_sizes, target_ratio, eps=1e-12):
@@ -1263,6 +1317,8 @@ if __name__ == '__main__':
     parser.add_argument('--module_rank_min', type=int, default=1, help='Minimum rank per module')
     parser.add_argument('--module_rank_min_attn', type=int, default=None, help='Minimum rank for attention proj modules')
     parser.add_argument('--module_rank_min_qkv', type=int, default=None, help='Minimum rank for q/k/v proj modules')
+    parser.add_argument('--early_layers', type=int, default=0, help='Apply early-layer qkv min to first N layers')
+    parser.add_argument('--early_layers_min_qkv', type=int, default=None, help='Minimum rank for q/k/v in early layers')
     parser.add_argument('--module_rank_min_o', type=int, default=None, help='Minimum rank for o/out proj modules')
     parser.add_argument('--module_rank_min_mlp', type=int, default=None, help='Minimum rank for gate/up proj modules')
     parser.add_argument('--module_rank_min_down', type=int, default=None, help='Minimum rank for down proj modules')
@@ -1346,6 +1402,10 @@ if __name__ == '__main__':
                 if spectrum_path is not None:
                     meta = _spectrum_meta(args, grad_nsamples, grad_seq_len)
                     torch.save({"meta": meta, "spectra": spectrum}, spectrum_path)
+            qkv_multiple = None
+            if args.module_rank_min_qkv is not None or args.early_layers_min_qkv is not None:
+                qkv_multiple = _get_head_dim(model)
+            early_layers = args.early_layers if args.early_layers is not None and args.early_layers > 0 else None
             module_ranks, effective_ratio = allocate_module_ranks(
                 spectrum,
                 args.ratio,
@@ -1353,6 +1413,9 @@ if __name__ == '__main__':
                 max_rank=args.module_rank_max,
                 min_rank_overrides=_module_rank_overrides(args),
                 layer_floor_ratio=args.layer_ratio_floor,
+                qkv_multiple=qkv_multiple,
+                early_layers=early_layers,
+                early_layers_min_qkv=args.early_layers_min_qkv,
             )
             if args.print_module_ranks and module_ranks is not None:
                 effective_ratio, layer_stats = summarize_module_ranks(spectrum, module_ranks)
@@ -1442,6 +1505,10 @@ if __name__ == '__main__':
                 if spectrum_path is not None:
                     meta = _spectrum_meta(args, grad_nsamples, grad_seq_len)
                     torch.save({"meta": meta, "spectra": spectrum}, spectrum_path)
+            qkv_multiple = None
+            if args.module_rank_min_qkv is not None or args.early_layers_min_qkv is not None:
+                qkv_multiple = _get_head_dim(model)
+            early_layers = args.early_layers if args.early_layers is not None and args.early_layers > 0 else None
             module_ranks, effective_ratio = allocate_module_ranks(
                 spectrum,
                 args.ratio,
@@ -1449,6 +1516,9 @@ if __name__ == '__main__':
                 max_rank=args.module_rank_max,
                 min_rank_overrides=_module_rank_overrides(args),
                 layer_floor_ratio=args.layer_ratio_floor,
+                qkv_multiple=qkv_multiple,
+                early_layers=early_layers,
+                early_layers_min_qkv=args.early_layers_min_qkv,
             )
             if args.print_module_ranks and module_ranks is not None:
                 effective_ratio, layer_stats = summarize_module_ranks(spectrum, module_ranks)
